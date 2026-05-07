@@ -7,7 +7,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/storacha/filecoin-services/go/bindings"
+	"github.com/fil-forge/filecoin-services/go/bindings"
 )
 
 // Pre-parse ABI types at package initialization for efficiency

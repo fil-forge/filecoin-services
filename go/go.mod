@@ -1,4 +1,4 @@
-module github.com/storacha/filecoin-services/go
+module github.com/fil-forge/filecoin-services/go
 
 go 1.25.3
 

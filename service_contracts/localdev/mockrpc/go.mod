@@ -1,4 +1,4 @@
-module github.com/storacha/filecoin-services/service_contracts/localdev/mockrpc
+module github.com/fil-forge/filecoin-services/service_contracts/localdev/mockrpc
 
 go 1.24.0
 
