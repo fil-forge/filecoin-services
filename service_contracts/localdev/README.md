@@ -209,14 +209,14 @@ cat deployed-addresses.json
 ### Basic Usage (Deploy from scratch)
 
 ```go
-import "github.com/storacha/piri/pkg/testutil/localdev"
+import "github.com/fil-forge/piri/pkg/testutil/localdev"
 
 func TestWithLocaldev(t *testing.T) {
     ctx := context.Background()
 
     // Start container (~30s, deploys contracts)
     container, err := localdev.Run(ctx,
-        localdev.WithImage("ghcr.io/storacha/filecoin-localdev:latest"),
+        localdev.WithImage("ghcr.io/fil-forge/filecoin-localdev:latest"),
         localdev.WithBlockTime(3),
     )
     require.NoError(t, err)
@@ -239,7 +239,7 @@ func TestWithLocaldevFast(t *testing.T) {
 
     // Start container (~3s, loads state)
     container, err := localdev.Run(ctx,
-        localdev.WithImage("ghcr.io/storacha/filecoin-localdev:latest"),
+        localdev.WithImage("ghcr.io/fil-forge/filecoin-localdev:latest"),
         localdev.WithStateFile("testdata/anvil-state.json"),
         localdev.WithDeployedAddressesFile("testdata/deployed-addresses.json"),
         localdev.WithBlockTime(3),

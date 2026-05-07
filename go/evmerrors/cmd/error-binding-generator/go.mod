@@ -1,4 +1,4 @@
-module github.com/storacha/filecoin-services/go/evmerrors/cmd/error-binding-generator
+module github.com/fil-forge/filecoin-services/go/evmerrors/cmd/error-binding-generator
 
 go 1.24.6
 
