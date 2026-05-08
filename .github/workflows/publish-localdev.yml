@@ -12,7 +12,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: storacha/filecoin-localdev
+  IMAGE_NAME: fil-forge/filecoin-localdev
 
 jobs:
   build-and-push:
