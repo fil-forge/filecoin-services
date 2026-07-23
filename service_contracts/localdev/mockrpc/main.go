@@ -615,7 +615,12 @@ func (s *Server) createMockTipSet(blockNum int64, parent *types.TipSet) *types.T
 	}
 
 	header := &types.BlockHeader{
-		Miner:                 s.miner,
+		Miner: s.miner,
+		// Ticket must be non-nil: lotus >= 1.36 types.NewTipSet rejects blocks
+		// with a nil Ticket ("block ... has nil Ticket"), which made the client's
+		// xrpc.ch.val unmarshal fail and silently drop every ChainNotify head
+		// change. The value is irrelevant to consumers (they only read Height).
+		Ticket:                &types.Ticket{VRFProof: []byte(fmt.Sprintf("mock-ticket-%d", blockNum))},
 		Height:                epoch,
 		Timestamp:             uint64(time.Now().Unix()),
 		Parents:               parents,
