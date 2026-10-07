@@ -117,8 +117,13 @@ library Rails {
         if (includeCDN) {
             requiredLockup += DEFAULT_CACHE_MISS_LOCKUP_AMOUNT + DEFAULT_CDN_LOCKUP_AMOUNT;
         }
-        requiredLockup = toTokenUnits(requiredLockup, scale);
         uint256 datasetFeePerEpoch = toTokenUnits(DATASET_FEE_PER_EPOCH, scale);
+        if (scale != 1) {
+            // In a token with fewer decimals the rail's minimum rate is the dataset fee rounded up to whole
+            // units, so require what the first piece addition will lock: that rate for the lockup period plus
+            // the converted reserve (#618). (CDN is rejected for these currencies.)
+            requiredLockup = datasetFeePerEpoch * DEFAULT_LOCKUP_PERIOD + toTokenUnits(LIFECYCLE_RESERVE_TARGET, scale);
+        }
 
         // Check that payer has sufficient available funds
         (,, uint256 availableFunds,) = payments.getAccountInfoIfSettled(token, payer);
