@@ -4,7 +4,12 @@ pragma solidity ^0.8.20;
 import {Cids} from "@pdp/Cids.sol";
 import {FilecoinWarmStorageServiceTest, TestDataSetAuthorizer} from "./FilecoinWarmStorageService.t.sol";
 import {Errors} from "../src/Errors.sol";
-import {DATA_SET_PRICING_STORAGE_SLOT, DataSetStoragePriceSet} from "../src/lib/DataSetPricing.sol";
+import {
+    DATA_SET_AUTHORIZER_ROOT_SLOT,
+    DATA_SET_PRICING_STORAGE_SLOT,
+    DataSetStoragePriceSet
+} from "../src/lib/DataSetPricing.sol";
+import {DATA_SET_AUTHORIZER_SLOT} from "../src/lib/FilecoinWarmStorageServiceLayout.sol";
 import {
     DATASET_FEE_PER_EPOCH,
     EPOCHS_PER_MONTH,
@@ -520,5 +525,11 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         uint256 word = uint256(pdpServiceWithPayments.extsload(slot));
         assertEq(uint128(word), price, "price in low 128 bits");
         assertEq(word >> 128, 0, "nonce in the next 64 bits");
+    }
+
+    /// Rails.updateStoragePrice reads the data set's authorizer from FWSS storage itself (it runs by
+    /// DELEGATECALL in the proxy); its copy of the root slot must match the generated layout.
+    function test_authorizerRootSlot_matchesLayout() public pure {
+        assertEq(DATA_SET_AUTHORIZER_ROOT_SLOT, DATA_SET_AUTHORIZER_SLOT);
     }
 }
