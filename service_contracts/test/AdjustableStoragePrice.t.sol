@@ -6,9 +6,9 @@ import {FilecoinWarmStorageServiceTest, TestDataSetAuthorizer} from "./FilecoinW
 import {Errors} from "../src/Errors.sol";
 import {
     DATA_SET_AUTHORIZER_ROOT_SLOT,
-    DATA_SET_PRICING_STORAGE_SLOT,
+    FWSS_DATA_SET_PRICING_STORAGE_SLOT,
     DataSetStoragePriceSet
-} from "../src/lib/DataSetPricing.sol";
+} from "../src/lib/PaymentTermsStorage.sol";
 import {DATA_SET_AUTHORIZER_SLOT} from "../src/lib/FilecoinWarmStorageServiceLayout.sol";
 import {
     DATASET_FEE_PER_EPOCH,
@@ -18,11 +18,11 @@ import {
 } from "../src/lib/PriceListUSDFC.sol";
 
 /// @notice Adjustable storage price per data set (FilOzone/filecoin-services#619).
-/// @dev The client signs an absolute storage price per TiB per month in a new CreateDataSetWithPayment
-///      message carried by a new extraData variant (shared with #618's token field). The provider consents
-///      by submitting the transaction. Zero means the posted price; prices below the posted price are
-///      rejected. A mutual-consent update (provider submits, payer signs) changes the price of an existing
-///      data set and re-prices its rail immediately. Signatures here are real ECDSA signatures over the
+/// @dev The client signs an absolute storage price per TiB per month (18-decimal USD) in a
+///      CreateDataSetWithPayment message carried by the 0xe0 extraData variant. The provider consents by
+///      submitting the transaction. The effective price is max(agreed, posted); zero means the posted price.
+///      A mutual-consent update (provider submits, payer signs with a deadline and the data set's stored
+///      nonce) changes the price of an existing data set and re-prices its rail immediately. Signatures here are real ECDSA signatures over the
 ///      live EIP-712 domain, so the type strings are checked end to end.
 contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
     bytes32 private constant METADATA_ENTRY_TYPEHASH_ = keccak256("MetadataEntry(string key,string value)");
@@ -34,8 +34,9 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         "CreateDataSetWithPayment(uint256 clientDataSetId,address payee,MetadataEntry[] metadata,address token,"
         "uint256 storagePricePerTibPerMonth)" "MetadataEntry(string key,string value)"
     );
-    bytes32 private constant UPDATE_STORAGE_PRICE_TYPEHASH =
-        keccak256("UpdateStoragePrice(uint256 dataSetId,uint256 nonce,uint256 storagePricePerTibPerMonth)");
+    bytes32 private constant UPDATE_STORAGE_PRICE_TYPEHASH = keccak256(
+        "UpdateStoragePrice(uint256 dataSetId,uint256 nonce,uint256 storagePricePerTibPerMonth,uint256 deadline)"
+    );
 
     uint8 private constant PIECE_HEIGHT = 30; // 2^30 leaves = 32 GiB padded
 
@@ -120,12 +121,21 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         );
     }
 
+    /// @dev Signs with deadline = the current block (the tests submit in the same block).
     function _signUpdate(uint256 key, uint256 dataSetId, uint256 nonce, uint256 price)
         private
         view
         returns (bytes memory)
     {
-        return _sign(key, keccak256(abi.encode(UPDATE_STORAGE_PRICE_TYPEHASH, dataSetId, nonce, price)));
+        return _signUpdateUntil(key, dataSetId, nonce, price, block.number);
+    }
+
+    function _signUpdateUntil(uint256 key, uint256 dataSetId, uint256 nonce, uint256 price, uint256 deadline)
+        private
+        view
+        returns (bytes memory)
+    {
+        return _sign(key, keccak256(abi.encode(UPDATE_STORAGE_PRICE_TYPEHASH, dataSetId, nonce, price, deadline)));
     }
 
     function _withPaymentExtraData(uint256 clientDataSetId, address token, uint256 price, bytes memory signature)
@@ -222,14 +232,14 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         assertEq(_railRate(dataSetId), _expectedRate(leafCount, STORAGE_PRICE_PER_TIB_PER_MONTH));
     }
 
-    function test_withPayment_belowPosted_reverts() public payerReady {
+    /// No floor check at creation: a price below posted is stored and the effective price is the posted one.
+    function test_withPayment_belowPosted_paysPosted() public payerReady {
         uint256 price = STORAGE_PRICE_PER_TIB_PER_MONTH - 1;
-        uint256 cdsId = clientDataSetIdCounter++;
-        bytes memory sig = _signCreateWithPayment(payerKey, cdsId, sp1, address(0), price);
-        bytes memory extraData = _withPaymentExtraData(cdsId, address(0), price, sig);
-        vm.expectRevert(abi.encodeWithSelector(Errors.InvalidStoragePrice.selector, price));
-        vm.prank(sp1);
-        mockPDPVerifier.createDataSet(pdpServiceWithPayments, extraData);
+        uint256 dataSetId = _createWithPrice(price);
+        (uint256 stored,) = viewContract.getDataSetStoragePrice(dataSetId);
+        assertEq(stored, price);
+        uint256 leafCount = _addPiece(dataSetId);
+        assertEq(_railRate(dataSetId), _expectedRate(leafCount, STORAGE_PRICE_PER_TIB_PER_MONTH));
     }
 
     function test_withPayment_priceAboveUint128_reverts() public payerReady {
@@ -338,7 +348,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         vm.expectEmit(true, false, false, true, address(pdpServiceWithPayments));
         emit DataSetStoragePriceSet(dataSetId, newPrice);
         vm.prank(sp1);
-        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, sig);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, block.number, sig);
 
         assertEq(_railRate(dataSetId), _expectedRate(leafCount, newPrice), "rail re-priced without a piece change");
         (uint256 stored, uint256 nonce) = viewContract.getDataSetStoragePrice(dataSetId);
@@ -351,7 +361,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         uint256 leafCount = _addPiece(dataSetId);
         bytes memory sig = _signUpdate(payerKey, dataSetId, 0, 0);
         vm.prank(sp1);
-        pdpServiceWithPayments.updateStoragePrice(dataSetId, 0, 0, sig);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, 0, 0, block.number, sig);
         assertEq(_railRate(dataSetId), _expectedRate(leafCount, STORAGE_PRICE_PER_TIB_PER_MONTH), "back to posted");
     }
 
@@ -360,7 +370,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         uint256 newPrice = 2 * STORAGE_PRICE_PER_TIB_PER_MONTH;
         bytes memory sig = _signUpdate(payerKey, dataSetId, 0, newPrice);
         vm.prank(sp1);
-        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, sig);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, block.number, sig);
         assertEq(_railRate(dataSetId), 0, "empty data set streams nothing");
 
         uint256 leafCount = _addPiece(dataSetId);
@@ -373,7 +383,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         bytes memory sig = _signUpdate(payerKey, dataSetId, 0, newPrice);
         vm.expectRevert(abi.encodeWithSelector(Errors.CallerNotServiceProvider.selector, dataSetId, sp1, payer));
         vm.prank(payer);
-        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, sig);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, block.number, sig);
     }
 
     function test_update_requiresPayerSignature() public payerReady {
@@ -383,7 +393,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         bytes memory sig = _signUpdate(strangerKey, dataSetId, 0, newPrice);
         vm.expectPartialRevert(Errors.InvalidSignature.selector);
         vm.prank(sp1);
-        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, sig);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, block.number, sig);
     }
 
     function test_update_providerCannotChangeSignedPrice() public payerReady {
@@ -391,7 +401,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         bytes memory sig = _signUpdate(payerKey, dataSetId, 0, 2 * STORAGE_PRICE_PER_TIB_PER_MONTH);
         vm.expectPartialRevert(Errors.InvalidSignature.selector);
         vm.prank(sp1);
-        pdpServiceWithPayments.updateStoragePrice(dataSetId, 9 * STORAGE_PRICE_PER_TIB_PER_MONTH, 0, sig);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, 9 * STORAGE_PRICE_PER_TIB_PER_MONTH, 0, block.number, sig);
     }
 
     function test_update_replayRejected() public payerReady {
@@ -399,16 +409,16 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         uint256 high = 3 * STORAGE_PRICE_PER_TIB_PER_MONTH;
         bytes memory toHigh = _signUpdate(payerKey, dataSetId, 0, high);
         vm.prank(sp1);
-        pdpServiceWithPayments.updateStoragePrice(dataSetId, high, 0, toHigh);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, high, 0, block.number, toHigh);
 
         bytes memory toPosted = _signUpdate(payerKey, dataSetId, 1, 0);
         vm.prank(sp1);
-        pdpServiceWithPayments.updateStoragePrice(dataSetId, 0, 1, toPosted);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, 0, 1, block.number, toPosted);
 
         // Replaying the first signature (nonce 0) fails even though the price is back where it started.
         vm.expectRevert(abi.encodeWithSelector(Errors.InvalidStoragePriceNonce.selector, dataSetId, 2, 0));
         vm.prank(sp1);
-        pdpServiceWithPayments.updateStoragePrice(dataSetId, high, 0, toHigh);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, high, 0, block.number, toHigh);
     }
 
     function test_update_signatureBoundToDataSet() public payerReady {
@@ -418,16 +428,54 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         bytes memory sigForA = _signUpdate(payerKey, a, 0, newPrice);
         vm.expectPartialRevert(Errors.InvalidSignature.selector);
         vm.prank(sp1);
-        pdpServiceWithPayments.updateStoragePrice(b, newPrice, 0, sigForA);
+        pdpServiceWithPayments.updateStoragePrice(b, newPrice, 0, block.number, sigForA);
     }
 
-    function test_update_belowPosted_reverts() public payerReady {
-        uint256 dataSetId = _createWithPrice(0);
+    /// Effective price = max(agreed, posted): an agreed price below posted is stored and charges posted.
+    function test_update_belowPosted_paysPosted() public payerReady {
+        uint256 dataSetId = _createWithPrice(3 * STORAGE_PRICE_PER_TIB_PER_MONTH);
+        uint256 leafCount = _addPiece(dataSetId);
         uint256 price = STORAGE_PRICE_PER_TIB_PER_MONTH / 2;
         bytes memory sig = _signUpdate(payerKey, dataSetId, 0, price);
-        vm.expectRevert(abi.encodeWithSelector(Errors.InvalidStoragePrice.selector, price));
         vm.prank(sp1);
-        pdpServiceWithPayments.updateStoragePrice(dataSetId, price, 0, sig);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, price, 0, block.number, sig);
+        (uint256 stored, uint256 nonce) = viewContract.getDataSetStoragePrice(dataSetId);
+        assertEq(stored, price);
+        assertEq(nonce, 1);
+        assertEq(_railRate(dataSetId), _expectedRate(leafCount, STORAGE_PRICE_PER_TIB_PER_MONTH));
+    }
+
+    function test_update_afterDeadline_reverts() public payerReady {
+        uint256 dataSetId = _createWithPrice(0);
+        uint256 newPrice = 2 * STORAGE_PRICE_PER_TIB_PER_MONTH;
+        uint256 deadline = block.number + 10;
+        bytes memory sig = _signUpdateUntil(payerKey, dataSetId, 0, newPrice, deadline);
+
+        vm.roll(deadline + 1);
+        vm.expectRevert(
+            abi.encodeWithSelector(Errors.StoragePriceUpdateExpired.selector, dataSetId, deadline, deadline + 1)
+        );
+        vm.prank(sp1);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, deadline, sig);
+
+        // At the deadline epoch itself the update is accepted
+        vm.roll(deadline);
+        vm.prank(sp1);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, deadline, sig);
+        (uint256 stored,) = viewContract.getDataSetStoragePrice(dataSetId);
+        assertEq(stored, newPrice);
+    }
+
+    /// The deadline is signed: the provider cannot extend an expired offer.
+    function test_update_providerCannotExtendDeadline() public payerReady {
+        uint256 dataSetId = _createWithPrice(0);
+        uint256 newPrice = 2 * STORAGE_PRICE_PER_TIB_PER_MONTH;
+        uint256 deadline = block.number + 10;
+        bytes memory sig = _signUpdateUntil(payerKey, dataSetId, 0, newPrice, deadline);
+        vm.roll(deadline + 1);
+        vm.expectPartialRevert(Errors.InvalidSignature.selector);
+        vm.prank(sp1);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, deadline + 100, sig);
     }
 
     function test_update_terminated_reverts() public payerReady {
@@ -440,13 +488,13 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         bytes memory sig = _signUpdate(payerKey, dataSetId, 0, newPrice);
         vm.expectRevert(abi.encodeWithSelector(Errors.DataSetPaymentAlreadyTerminated.selector, dataSetId));
         vm.prank(sp1);
-        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, sig);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, block.number, sig);
     }
 
     function test_update_unknownDataSet_reverts() public payerReady {
         vm.expectRevert(abi.encodeWithSelector(Errors.InvalidDataSetId.selector, 999));
         vm.prank(sp1);
-        pdpServiceWithPayments.updateStoragePrice(999, 0, 0, "");
+        pdpServiceWithPayments.updateStoragePrice(999, 0, 0, block.number, "");
     }
 
     function test_update_rateIncreaseNeedsPayerRateAllowance() public payerReady {
@@ -462,7 +510,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         bytes memory sig = _signUpdate(payerKey, dataSetId, 0, newPrice);
         vm.expectRevert();
         vm.prank(sp1);
-        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, sig);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, block.number, sig);
 
         (uint256 stored, uint256 nonce) = viewContract.getDataSetStoragePrice(dataSetId);
         assertEq(stored, 0, "atomic: price unchanged");
@@ -480,7 +528,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         uint256 newPrice = 2 * STORAGE_PRICE_PER_TIB_PER_MONTH;
         bytes memory sig = _signUpdate(sessionSignerKey, dataSetId, 0, newPrice);
         vm.prank(sp1);
-        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, sig);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, block.number, sig);
         (uint256 stored,) = viewContract.getDataSetStoragePrice(dataSetId);
         assertEq(stored, newPrice);
     }
@@ -498,11 +546,11 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         bytes memory payerSig = _signUpdate(payerKey, dataSetId, 0, newPrice);
         vm.expectPartialRevert(Errors.Unauthorized.selector);
         vm.prank(sp1);
-        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, payerSig);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, block.number, payerSig);
 
         bytes memory delegateSig = _signUpdate(delegateKey, dataSetId, 0, newPrice);
         vm.prank(sp1);
-        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, delegateSig);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, block.number, delegateSig);
         (uint256 stored,) = viewContract.getDataSetStoragePrice(dataSetId);
         assertEq(stored, newPrice);
     }
@@ -512,19 +560,25 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
     // ------------------------------------------------------------------
 
     function test_pricingNamespace_slotPinned() public payerReady {
-        // keccak256(abi.encode(uint256(keccak256("filecoin-warm-storage-service.DataSetPricing")) - 1))
-        //   & ~bytes32(uint256(0xff))
         assertEq(
-            DATA_SET_PRICING_STORAGE_SLOT,
-            0xe60d4b8c9786d4bff16c61a200159c92875861d64c13f886bd854066b070bc00,
+            FWSS_DATA_SET_PRICING_STORAGE_SLOT,
+            keccak256(abi.encode(uint256(keccak256("filecoin.storage.FWSSDataSetPricing")) - 1))
+                & ~bytes32(uint256(0xff)),
             "ERC-7201 slot"
         );
         uint256 price = 2 * STORAGE_PRICE_PER_TIB_PER_MONTH;
         uint256 dataSetId = _createWithPrice(price);
-        bytes32 slot = keccak256(abi.encode(dataSetId, DATA_SET_PRICING_STORAGE_SLOT));
+        bytes32 slot = keccak256(abi.encode(dataSetId, FWSS_DATA_SET_PRICING_STORAGE_SLOT));
         uint256 word = uint256(pdpServiceWithPayments.extsload(slot));
         assertEq(uint128(word), price, "price in low 128 bits");
-        assertEq(word >> 128, 0, "nonce in the next 64 bits");
+        assertEq(word >> 128, 0, "nonce in the next 64 bits, default currency id 0 above it");
+
+        bytes memory sig = _signUpdate(payerKey, dataSetId, 0, 3 * price);
+        vm.prank(sp1);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, 3 * price, 0, block.number, sig);
+        word = uint256(pdpServiceWithPayments.extsload(slot));
+        assertEq(uint128(word), 3 * price);
+        assertEq(uint64(word >> 128), 1, "stored per-data-set nonce");
     }
 
     /// Rails.updateStoragePrice reads the data set's authorizer from FWSS storage itself (it runs by
