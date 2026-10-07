@@ -9,8 +9,6 @@ import {Cids} from "@pdp/Cids.sol";
 import {FilecoinPayV1} from "@fws-payments/FilecoinPayV1.sol";
 import {FilecoinWarmStorageServiceTest} from "./FilecoinWarmStorageService.t.sol";
 import {FilecoinWarmStorageService} from "../src/FilecoinWarmStorageService.sol";
-import {FilecoinWarmStorageServiceStateView} from "../src/FilecoinWarmStorageServiceStateView.sol";
-import {MyERC1967Proxy} from "@pdp/ERC1967Proxy.sol";
 import {Errors} from "../src/Errors.sol";
 import {PriceList} from "../src/lib/PriceList.sol";
 import {DATA_SET_INFO_SLOT} from "../src/lib/FilecoinWarmStorageServiceLayout.sol";
@@ -912,46 +910,60 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
     }
 
     // ---------------------------------------------------------------------
-    // gas (logged; signatures mocked, measured around MockPDPVerifier.createDataSet)
+    // gas (logged; signatures mocked; accounts and storage cooled before each measured call so each
+    // reads like the first call of a transaction; includes MockPDPVerifier.createDataSet overhead)
+
+    function _cool() internal {
+        vm.cool(address(pdpServiceWithPayments));
+        vm.cool(address(payments));
+        vm.cool(address(mockUSDFC));
+        vm.cool(address(axl));
+        vm.cool(address(serviceProviderRegistry));
+        vm.cool(address(sessionKeyRegistry));
+        vm.cool(address(mockPDPVerifier));
+    }
+
+    function _measureCreate(string memory label, bytes memory extra) internal returns (uint256 dataSetId) {
+        _cool();
+        vm.prank(serviceProvider);
+        uint256 g = gasleft();
+        dataSetId = mockPDPVerifier.createDataSet(pdpServiceWithPayments, extra);
+        console.log(label, g - gasleft());
+    }
 
     function testGas_CreateDataSetVariants() public withTokens {
         pdpServiceWithPayments.setCurrency(address(axl), true);
         _fund(client, mockUSDFC, 100e18);
         _fund(client, axl, 100e6);
         makeSignaturePass(client);
-
+        // Warm-up creates (not measured) so first-use writes for this payer in each token are paid up front
         vm.prank(serviceProvider);
-        uint256 g = gasleft();
-        mockPDPVerifier.createDataSet(pdpServiceWithPayments, _extraDataV1(client, 80, FAKE_SIGNATURE));
-        console.log("gas createDataSet legacy (USDFC)", g - gasleft());
-
-        bytes memory extra = _extraDataV2(client, 81, false, FAKE_SIGNATURE, address(0));
+        mockPDPVerifier.createDataSet(pdpServiceWithPayments, _extraDataV1(client, 78, FAKE_SIGNATURE));
         vm.prank(serviceProvider);
-        g = gasleft();
-        mockPDPVerifier.createDataSet(pdpServiceWithPayments, extra);
-        console.log("gas createDataSet 0xc0 (USDFC)", g - gasleft());
+        mockPDPVerifier.createDataSet(
+            pdpServiceWithPayments, _extraDataV2(client, 79, false, FAKE_SIGNATURE, address(axl))
+        );
 
-        extra = _extraDataV2(client, 82, false, FAKE_SIGNATURE, address(axl));
-        vm.prank(serviceProvider);
-        g = gasleft();
-        mockPDPVerifier.createDataSet(pdpServiceWithPayments, extra);
-        console.log("gas createDataSet 0xc0 (axlUSDC)", g - gasleft());
-
-        extra = _extraDataV2Priced(client, 83, false, FAKE_SIGNATURE, address(0), 5e18);
-        vm.prank(serviceProvider);
-        g = gasleft();
-        mockPDPVerifier.createDataSet(pdpServiceWithPayments, extra);
-        console.log("gas createDataSet 0xe0 (USDFC, priced)", g - gasleft());
-
-        extra = _extraDataV2Priced(client, 84, false, FAKE_SIGNATURE, address(axl), 5e18);
-        vm.prank(serviceProvider);
-        g = gasleft();
-        uint256 dataSetId = mockPDPVerifier.createDataSet(pdpServiceWithPayments, extra);
-        console.log("gas createDataSet 0xe0 (axlUSDC, priced)", g - gasleft());
+        _measureCreate("gas createDataSet legacy 0xa0 (USDFC)", _extraDataV1(client, 80, FAKE_SIGNATURE));
+        _measureCreate(
+            "gas createDataSet 0xc0 (USDFC)", _extraDataV2(client, 81, false, FAKE_SIGNATURE, address(mockUSDFC))
+        );
+        _measureCreate(
+            "gas createDataSet 0xc0 (axlUSDC)", _extraDataV2(client, 82, false, FAKE_SIGNATURE, address(axl))
+        );
+        _measureCreate(
+            "gas createDataSet 0xe0 (USDFC, priced)",
+            _extraDataV2Priced(client, 83, false, FAKE_SIGNATURE, address(0), 5e18)
+        );
+        uint256 dataSetId = _measureCreate(
+            "gas createDataSet 0xe0 (axlUSDC, priced)",
+            _extraDataV2Priced(client, 84, false, FAKE_SIGNATURE, address(axl), 5e18)
+        );
 
         _grow(dataSetId);
+        _cool();
         vm.prank(serviceProvider);
-        g = gasleft();
+        uint256 g = gasleft();
         pdpServiceWithPayments.updateStoragePrice(dataSetId, 6e18, 0, block.number, FAKE_SIGNATURE);
         console.log("gas updateStoragePrice (axlUSDC, ~100 GiB)", g - gasleft());
     }

@@ -17,6 +17,17 @@
   },
   {
     "type": "error",
+    "name": "CDNNotSupportedForCurrency",
+    "inputs": [
+      {
+        "name": "token",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "CDNPaymentAlreadyTerminated",
     "inputs": [
       {
@@ -178,6 +189,22 @@
     "type": "error",
     "name": "CurrencyAlreadyAdded",
     "inputs": [
+      {
+        "name": "token",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "CurrencyNotAcceptedByProvider",
+    "inputs": [
+      {
+        "name": "providerId",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
       {
         "name": "token",
         "type": "address",
@@ -979,6 +1006,27 @@
   },
   {
     "type": "error",
+    "name": "StoragePriceUpdateExpired",
+    "inputs": [
+      {
+        "name": "dataSetId",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "deadline",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "currentBlock",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "StorageProviderChangesNotSupported",
     "inputs": []
   },
@@ -1037,6 +1085,17 @@
         "name": "token",
         "type": "address",
         "internalType": "address"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "UnsupportedExtraDataVariant",
+    "inputs": [
+      {
+        "name": "keysOffset",
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ]
   },

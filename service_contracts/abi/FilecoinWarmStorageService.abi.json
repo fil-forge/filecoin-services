@@ -893,6 +893,11 @@
         "internalType": "uint256"
       },
       {
+        "name": "deadline",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
         "name": "signature",
         "type": "bytes",
         "internalType": "bytes"
@@ -1777,22 +1782,6 @@
         "name": "challengeWindowSize",
         "type": "uint256",
         "internalType": "uint256"
-      }
-    ]
-  },
-  {
-    "type": "error",
-    "name": "InvalidCurrencyDecimals",
-    "inputs": [
-      {
-        "name": "token",
-        "type": "address",
-        "internalType": "address"
-      },
-      {
-        "name": "decimals",
-        "type": "uint8",
-        "internalType": "uint8"
       }
     ]
   },

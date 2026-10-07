@@ -51,25 +51,40 @@ uint256 constant REPLENISH_THRESHOLD = (25 * 10 ** TOKEN_DECIMALS) / 1000; // $0
  * @return ratePerEpoch The calculated rate per epoch in the token's smallest unit
  */
 function calculateStorageSizeBasedRatePerEpoch(uint256 totalBytes) pure returns (uint256 ratePerEpoch) {
-    return calculateStorageSizeBasedRatePerEpochAtPrice(totalBytes, STORAGE_PRICE_PER_TIB_PER_MONTH);
-}
-
-/**
- * @notice Calculate a per-epoch rate for a given storage price per TiB per month
- * @dev The price applies to the size-proportional term only; the per-dataset fee is always the posted
- *      DATASET_FEE_PER_EPOCH.
- * @param totalBytes Total size of the stored data in bytes
- * @param storagePricePerTibPerMonth Storage price in the token's smallest unit
- * @return ratePerEpoch The calculated rate per epoch in the token's smallest unit
- */
-function calculateStorageSizeBasedRatePerEpochAtPrice(uint256 totalBytes, uint256 storagePricePerTibPerMonth)
-    pure
-    returns (uint256 ratePerEpoch)
-{
-    uint256 numerator = totalBytes * storagePricePerTibPerMonth;
+    uint256 numerator = totalBytes * STORAGE_PRICE_PER_TIB_PER_MONTH;
     uint256 denominator = TIB_IN_BYTES * EPOCHS_PER_MONTH;
 
     return numerator / denominator + DATASET_FEE_PER_EPOCH;
+}
+
+/**
+ * @notice Converts an 18-decimal USD amount to the units of a token, rounding up (#618)
+ * @param amount Amount in 18-decimal USD (price-list units)
+ * @param scale 10 ** (18 - token decimals); 1 for 18-decimal tokens, which leaves the amount unchanged
+ * @return Amount in the token's smallest unit, at least 1 for any nonzero amount
+ */
+function toTokenUnits(uint256 amount, uint256 scale) pure returns (uint256) {
+    return amount == 0 ? 0 : (amount - 1) / scale + 1;
+}
+
+/**
+ * @notice Calculate the storage rate per epoch at an agreed storage price, in a token's units (#618, #619)
+ * @dev Each per-epoch term is computed at 18 decimals exactly as `calculateStorageRate` does and then converted
+ *      to token units with ceiling division, so an 18-decimal token pays exactly the main formula and a
+ *      6-decimal token pays at least one unit for each nonzero term.
+ * @param leafCount the count of the 32b leaves in the FRC-0069 tree
+ * @param storagePricePerTibPerMonth Storage price in 18-decimal USD per TiB per month
+ * @param scale 10 ** (18 - token decimals)
+ * @return storageRatePerEpoch The storage rate per epoch in the token's smallest unit
+ */
+function calculateStorageRateAtPrice(uint256 leafCount, uint256 storagePricePerTibPerMonth, uint256 scale)
+    pure
+    returns (uint256 storageRatePerEpoch)
+{
+    if (leafCount == 0) return 0;
+    uint256 sizeTerm =
+        (Cids.leafCountToRawSize(leafCount) * storagePricePerTibPerMonth) / (TIB_IN_BYTES * EPOCHS_PER_MONTH);
+    return toTokenUnits(sizeTerm, scale) + toTokenUnits(DATASET_FEE_PER_EPOCH, scale);
 }
 
 /**
@@ -78,26 +93,8 @@ function calculateStorageSizeBasedRatePerEpochAtPrice(uint256 totalBytes, uint25
  * @return storageRatePerEpoch The storage rate per epoch
  */
 function calculateStorageRate(uint256 leafCount) pure returns (uint256 storageRatePerEpoch) {
-    return calculateStorageRateAtPrice(leafCount, STORAGE_PRICE_PER_TIB_PER_MONTH, 1);
-}
-
-/**
- * @notice Calculate the storage rate per epoch at a storage price, in a currency whose amounts are
- *         `amount18 / scale` (#618, #619)
- * @dev Each term is truncated separately, so a 6-decimal currency at the posted price is charged exactly
- *      what a price list written at 6 decimals would charge (size term plus one unit of dataset fee).
- * @param leafCount the count of the 32b leaves in the FRC-0069 tree
- * @param storagePricePerTibPerMonth Storage price in the token's smallest unit
- * @param scale 10 ** (18 - token decimals)
- * @return storageRatePerEpoch The storage rate per epoch
- */
-function calculateStorageRateAtPrice(uint256 leafCount, uint256 storagePricePerTibPerMonth, uint256 scale)
-    pure
-    returns (uint256 storageRatePerEpoch)
-{
     if (leafCount == 0) return 0;
-    return (Cids.leafCountToRawSize(leafCount) * storagePricePerTibPerMonth) / (TIB_IN_BYTES * EPOCHS_PER_MONTH)
-        + DATASET_FEE_PER_EPOCH / scale;
+    return calculateStorageSizeBasedRatePerEpoch(Cids.leafCountToRawSize(leafCount));
 }
 
 /**

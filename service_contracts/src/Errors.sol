@@ -384,8 +384,8 @@ library Errors {
     /// @notice The whitelist holds the maximum of 255 currencies
     error TooManyCurrencies();
 
-    /// @notice A client-agreed storage price is below the posted price or does not fit in 128 bits
-    /// @param storagePricePerTibPerMonth The rejected price (0 means the posted price and is always valid)
+    /// @notice A client-agreed storage price does not fit the 128-bit stored field
+    /// @param storagePricePerTibPerMonth The rejected price, in 18-decimal USD per TiB per month
     error InvalidStoragePrice(uint256 storagePricePerTibPerMonth);
 
     /// @notice The price-update nonce does not match the data set's current nonce
@@ -393,4 +393,23 @@ library Errors {
     /// @param expected The data set's current nonce
     /// @param actual The nonce supplied (and signed)
     error InvalidStoragePriceNonce(uint256 dataSetId, uint256 expected, uint256 actual);
+
+    /// @notice The signed UpdateStoragePrice deadline has passed
+    /// @param dataSetId The data set ID
+    /// @param deadline The last epoch at which the signed update may be submitted
+    /// @param currentBlock The current block number
+    error StoragePriceUpdateExpired(uint256 dataSetId, uint256 deadline, uint256 currentBlock);
+
+    /// @notice The provider does not list the token in its `paymentTokens` registry capability
+    /// @param providerId The provider ID
+    /// @param token The requested token
+    error CurrencyNotAcceptedByProvider(uint256 providerId, address token);
+
+    /// @notice The withCDN option is only available in the deployment's default token
+    /// @param token The requested token
+    error CDNNotSupportedForCurrency(address token);
+
+    /// @notice The create-data-set extraData is in none of the supported variants
+    /// @param keysOffset ABI offset of the `keys` field (0xa0 legacy, 0xc0 with currency, 0xe0 with payment terms)
+    error UnsupportedExtraDataVariant(uint256 keysOffset);
 }

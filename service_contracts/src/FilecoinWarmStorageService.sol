@@ -24,12 +24,10 @@ import {
     CACHE_MISS_EGRESS_PRICE_PER_TIB,
     ADD_PIECES_BASE_FEE,
     ADD_PIECES_PER_PIECE_FEE,
-    CREATE_DATA_SET_FEE,
     CDN_EGRESS_PRICE_PER_TIB,
     DATASET_FEE_PER_MONTH,
     DEFAULT_LOCKUP_PERIOD,
     EPOCHS_PER_MONTH,
-    LIFECYCLE_RESERVE_TARGET,
     SCHEDULE_PIECE_REMOVALS_FEE,
     SERVICE_COMMISSION_BPS,
     STORAGE_PRICE_PER_TIB_PER_MONTH,
@@ -37,7 +35,7 @@ import {
     TOKEN_DECIMALS
 } from "./lib/PriceListUSDFC.sol";
 import {Rails} from "./lib/Rails.sol";
-import {MIN_CURRENCY_DECIMALS} from "./lib/CurrencyRegistry.sol";
+import {PaymentTermsStorage} from "./lib/PaymentTermsStorage.sol";
 import {SignatureVerificationLib} from "./lib/SignatureVerificationLib.sol";
 
 uint256 constant NO_PROVING_DEADLINE = 0;
@@ -81,7 +79,8 @@ contract FilecoinWarmStorageService is
     UUPSUpgradeable,
     OwnableUpgradeable,
     Extsload,
-    EIP712Upgradeable
+    EIP712Upgradeable,
+    PaymentTermsStorage
 {
     // Version tracking
     string public constant VERSION = "1.4.0";
@@ -158,11 +157,9 @@ contract FilecoinWarmStorageService is
         uint256 clientDataSetId; // ClientDataSetID
         uint256 pdpEndEpoch; // 0 if PDP rail are not terminated
         uint256 providerId; // Provider ID from the ServiceProviderRegistry
-        uint96 pendingOneTimePayments; // fees accumulated since last flush via updateStorageRates
-        uint96 lifecycleReserveBalance; // local mirror of rail's lockupFixed; decremented on flush
-        // Payment currency (#618): bits 0-7 CurrencyRegistry id (0 = usdfcTokenAddress), bits 8-15
-        // decimal shift (18 - token decimals). Amounts charged are price-list amounts / 10**shift.
-        uint16 currency;
+        uint96 pendingOneTimePayments; // fees accumulated since last flush via updateStorageRates; 18-decimal USD,
+        // paid in the data set's token units rounded up (#618)
+        uint96 lifecycleReserveBalance; // local mirror of rail's lockupFixed (token units); decremented on flush
     }
 
     // Storage for data set payment information with dataSetId
@@ -242,9 +239,6 @@ contract FilecoinWarmStorageService is
 
     // Upgrade sequence number, used by Initializable.reinitializer
     uint64 private immutable REINITIALIZER_VERSION;
-
-    // Currency code of usdfcTokenAddress: id 0, decimal shift (18 - decimals) in bits 8-15 (#618)
-    uint16 private immutable DEFAULT_CURRENCY_CODE;
 
     // External contract addresses
     address public immutable pdpVerifierAddress;
@@ -389,14 +383,7 @@ contract FilecoinWarmStorageService is
         sessionKeyRegistry = _sessionKeyRegistry;
 
         // Verify token decimals from the USDFC token contract
-        // Any 6-18 decimal USD stablecoin can be the default token; amounts scale to its decimals.
-        // Proxies created before #618 hold 18-decimal USDFC data sets with a zero currency code.
-        uint8 decimals = _usdfc.decimals();
-        require(
-            decimals >= MIN_CURRENCY_DECIMALS && decimals <= TOKEN_DECIMALS,
-            Errors.InvalidCurrencyDecimals(address(_usdfc), decimals)
-        );
-        DEFAULT_CURRENCY_CODE = uint16(TOKEN_DECIMALS - decimals) << 8;
+        require(TOKEN_DECIMALS == _usdfc.decimals());
     }
 
     /**
@@ -560,7 +547,7 @@ contract FilecoinWarmStorageService is
      * @dev Owner only. Implemented by `Rails.setCurrency(address,bool)`, which checks the owner;
      *      the call is forwarded unchanged.
      *      Disabling stops new data sets in the token; existing data sets keep paying in it.
-     * @param token The stablecoin (6 to 18 decimals); amounts are the USD price list scaled to it
+     * @param token The stablecoin (6 to 18 decimals); amounts are the USD price list converted to it
      * @param enabled Whether new data sets may use it
      */
     function setCurrency(address token, bool enabled) external {
@@ -614,21 +601,20 @@ contract FilecoinWarmStorageService is
         clientNonces[createData.payer][createData.clientDataSetId] = dataSetId;
         clientDataSets[createData.payer].push(dataSetId);
 
-        // Verify the client's signature over either extraData variant. The CreateDataSetWithPayment variant
-        // also selects the payment token (#618) and records the agreed storage price (#619).
-        (address token, uint16 currencyCode) = SignatureVerificationLib.verifyCreateDataSet(
+        // Verify the client's signature over any of the three extraData variants. The 0xc0 and 0xe0 variants
+        // also select the payment token (#618); 0xe0 records the agreed storage price (#619).
+        address token = SignatureVerificationLib.verifyCreateDataSet(
             extraData,
             dataSetId,
             payee,
+            providerId,
             address(usdfcTokenAddress),
-            DEFAULT_CURRENCY_CODE,
             _domainSeparatorV4(),
             sessionKeyRegistry
         );
 
         // Initialize the DataSetInfo struct
         DataSetInfo storage info = dataSetInfo[dataSetId];
-        info.currency = currencyCode;
         info.payer = createData.payer;
         info.payee = payee; // Using payee address from registry
         info.serviceProvider = serviceProvider; // Set the service provider
@@ -676,14 +662,11 @@ contract FilecoinWarmStorageService is
         bool hasCDN = hasCDNMetadataKey(createData.metadataKeys);
 
         (uint256 pdpRailId, uint256 cacheMissRailId, uint256 cdnRailId) = payments.createRails(
-            dataSetId, IERC20(token), createData.payer, payee, hasCDN ? filBeamBeneficiaryAddress : address(0)
+            info, dataSetId, IERC20(token), createData.payer, payee, hasCDN ? filBeamBeneficiaryAddress : address(0)
         );
 
         railToDataSet[pdpRailId] = dataSetId;
         info.pdpRailId = pdpRailId;
-        uint256 scale = _currencyScale(info);
-        info.lifecycleReserveBalance = uint96(LIFECYCLE_RESERVE_TARGET / scale);
-        info.pendingOneTimePayments = uint96(CREATE_DATA_SET_FEE / scale);
         if (hasCDN) {
             info.cacheMissRailId = cacheMissRailId;
             info.cdnRailId = cdnRailId;
@@ -866,8 +849,8 @@ contract FilecoinWarmStorageService is
             dataSetId, payer, info.clientDataSetId, pieceData, nonce, metadataKeys, metadataValues, signature
         );
 
-        uint96 pending = info.pendingOneTimePayments
-            + uint96((ADD_PIECES_BASE_FEE + pieceData.length * ADD_PIECES_PER_PIECE_FEE) / _currencyScale(info));
+        uint96 pending =
+            info.pendingOneTimePayments + uint96(ADD_PIECES_BASE_FEE + pieceData.length * ADD_PIECES_PER_PIECE_FEE);
         uint96 reserveBalance = info.lifecycleReserveBalance;
 
         // Validate lockup for the new data set size (fail-fast if client has insufficient funds)
@@ -943,10 +926,11 @@ contract FilecoinWarmStorageService is
         // Verify the signature
         verifySchedulePieceRemovalsSignature(dataSetId, payer, info.clientDataSetId, pieceIds, signature);
 
-        uint256 scale = _currencyScale(info);
-        uint96 newPending = info.pendingOneTimePayments + uint96(SCHEDULE_PIECE_REMOVALS_FEE / scale);
+        uint96 newPending = info.pendingOneTimePayments + uint96(SCHEDULE_PIECE_REMOVALS_FEE);
         info.lifecycleReserveBalance = FilecoinPayV1(paymentsContractAddress)
-            .replenishReserveIfNeeded(info.pdpRailId, info.pdpEndEpoch, info.lifecycleReserveBalance, newPending, scale);
+            .replenishReserveIfNeeded(
+                dataSetId, info.pdpRailId, info.pdpEndEpoch, info.lifecycleReserveBalance, newPending
+            );
         info.pendingOneTimePayments = newPending;
 
         // Queue piece IDs for metadata cleanup at nextProvingPeriod
@@ -1145,7 +1129,7 @@ contract FilecoinWarmStorageService is
             bytes memory signature = abi.decode(extraData, (bytes));
             approver = _verifyTerminateServiceSignature(info.payer, dataSetId, signature);
             immediateTermination = true;
-            info.pendingOneTimePayments += uint96(TERMINATE_FEE / _currencyScale(info));
+            info.pendingOneTimePayments += uint96(TERMINATE_FEE);
         } else {
             require(
                 msg.sender == info.payer || msg.sender == info.serviceProvider,
@@ -1188,23 +1172,31 @@ contract FilecoinWarmStorageService is
     }
 
     /**
-     * @notice Changes a data set's storage price by mutual consent
+     * @notice Changes a data set's storage price by mutual consent (#619)
      * @dev The service provider submits; the payer (or its session key, or the data set's authorizer) signs
-     *      UpdateStoragePrice(dataSetId, nonce, storagePricePerTibPerMonth). The rail is re-priced in the same
-     *      call and the new rate applies from the next epoch. 0 restores the posted price.
+     *      UpdateStoragePrice(dataSetId, nonce, storagePricePerTibPerMonth, deadline). The rail is re-priced in the
+     *      same call and the new rate applies from the next epoch. The effective price is max(agreed, posted).
      * @param dataSetId The data set ID
-     * @param storagePricePerTibPerMonth New agreed price in the data set's token units (0 = posted price)
+     * @param storagePricePerTibPerMonth New agreed price in 18-decimal USD per TiB per month (0 = posted price)
      * @param nonce The data set's current price-update nonce
+     * @param deadline Last epoch at which the signed update may be submitted
      * @param signature The payer's EIP-712 signature
      */
     function updateStoragePrice(
         uint256 dataSetId,
         uint256 storagePricePerTibPerMonth,
         uint256 nonce,
+        uint256 deadline,
         bytes calldata signature
     ) external {
         Rails.updateStoragePrice(
-            dataSetInfo[dataSetId], dataSetId, storagePricePerTibPerMonth, nonce, signature, _domainSeparatorV4()
+            dataSetInfo[dataSetId],
+            dataSetId,
+            storagePricePerTibPerMonth,
+            nonce,
+            deadline,
+            signature,
+            _domainSeparatorV4()
         );
     }
 
@@ -1314,14 +1306,6 @@ contract FilecoinWarmStorageService is
                 dataSetId, pdpRailId, leafCount, pending, reserveBalance, info.pdpEndEpoch, immediateTermination
             );
         info.pendingOneTimePayments = 0;
-    }
-
-    /// @dev Divisor from the 18-decimal price list to the data set's token units.
-    function _currencyScale(DataSetInfo storage info) internal view returns (uint256 scale) {
-        uint256 code = info.currency;
-        assembly ("memory-safe") {
-            scale := exp(10, shr(8, code))
-        }
     }
 
     function processScheduledPieceMetadataRemovals(uint256 dataSetId) internal returns (bool hadRemovals) {

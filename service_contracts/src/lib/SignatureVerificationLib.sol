@@ -5,14 +5,20 @@ import {Cids} from "@pdp/Cids.sol";
 import {SessionKeyRegistry} from "@session-key-registry/SessionKeyRegistry.sol";
 import {Errors} from "../Errors.sol";
 import {IDataSetAuthorizer} from "../interfaces/IDataSetAuthorizer.sol";
-import {DataSetPricing} from "./DataSetPricing.sol";
-import {CurrencyRegistry} from "./CurrencyRegistry.sol";
+import {ServiceProviderRegistry} from "../ServiceProviderRegistry.sol";
+import {ServiceProviderRegistryStorage} from "../ServiceProviderRegistryStorage.sol";
+import {PAYMENT_TOKENS_CAPABILITY_KEY, PaymentTerms, PaymentTermsStorage} from "./PaymentTermsStorage.sol";
 
-/// @dev ABI offset of `keys` in the CreateDataSetWithPayment extraData variant
-///      abi.encode(payer, clientDataSetId, keys, values, signature, token, storagePricePerTibPerMonth):
-///      a seven-word head. Standard encoders put `keys` of the legacy five-field encoding at 0xa0. A
-///      non-standard encoding that lands on 0xe0 is verified against the CreateDataSetWithPayment type hash,
-///      so it fails without a signature over that type.
+/// @dev The FWSS getter used to reach the provider registry from library code running in FWSS's context.
+interface IServiceProviderRegistryHolder {
+    function serviceProviderRegistry() external view returns (ServiceProviderRegistry);
+}
+
+/// @dev ABI offsets of `keys` (the first dynamic field) in the create-data-set extraData variants: a five-word
+///      head for the legacy tuple, six words with `address token` (#618), seven words with
+///      `address token, uint256 storagePricePerTibPerMonth` (#619).
+uint256 constant LEGACY_KEYS_OFFSET = 0xa0;
+uint256 constant CREATE_DATA_SET_WITH_CURRENCY_KEYS_OFFSET = 0xc0;
 uint256 constant CREATE_DATA_SET_WITH_PAYMENT_KEYS_OFFSET = 0xe0;
 
 /// @title SignatureVerificationLib
@@ -46,16 +52,23 @@ library SignatureVerificationLib {
 
     bytes32 internal constant TERMINATE_SERVICE_TYPEHASH = keccak256("TerminateService(uint256 dataSetId)");
 
-    /// @dev CreateDataSet plus payment terms (#618 token, #619 storage price). Carried by the extraData
-    ///      variant whose head has seven words. token == address(0) means the deployment's default token;
-    ///      storagePricePerTibPerMonth == 0 means the posted price.
+    /// @dev CreateDataSet plus the payment token (#618), carried by the 0xc0 extraData variant. token == address(0)
+    ///      means the deployment's default token.
+    bytes32 internal constant CREATE_DATA_SET_WITH_CURRENCY_TYPEHASH = keccak256(
+        "CreateDataSetWithCurrency(uint256 clientDataSetId,address payee,MetadataEntry[] metadata,address token)"
+        "MetadataEntry(string key,string value)"
+    );
+
+    /// @dev CreateDataSet plus the payment token and the agreed storage price in 18-decimal USD (#619), carried by
+    ///      the 0xe0 extraData variant. storagePricePerTibPerMonth == 0 means the posted price.
     bytes32 internal constant CREATE_DATA_SET_WITH_PAYMENT_TYPEHASH = keccak256(
         "CreateDataSetWithPayment(uint256 clientDataSetId,address payee,MetadataEntry[] metadata,address token,"
         "uint256 storagePricePerTibPerMonth)" "MetadataEntry(string key,string value)"
     );
 
-    bytes32 internal constant UPDATE_STORAGE_PRICE_TYPEHASH =
-        keccak256("UpdateStoragePrice(uint256 dataSetId,uint256 nonce,uint256 storagePricePerTibPerMonth)");
+    bytes32 internal constant UPDATE_STORAGE_PRICE_TYPEHASH = keccak256(
+        "UpdateStoragePrice(uint256 dataSetId,uint256 nonce,uint256 storagePricePerTibPerMonth,uint256 deadline)"
+    );
 
     // ============================================================================
     // Metadata Hashing Functions
@@ -315,75 +328,95 @@ library SignatureVerificationLib {
         return _verifyAuthorizer(payer, signature, digest, TERMINATE_SERVICE_TYPEHASH, dataSetId, authorizer, bytes(""));
     }
 
-    /// @notice Verifies the payer's signature over data set creation extraData, in either variant, resolves
-    ///         the payment currency (#618) and records the agreed storage price (#619).
-    /// @dev Legacy variant: CreateDataSet(clientDataSetId, payee, metadata), unchanged, pays in the default
-    ///      token. New variant (keys at offset 0xe0): CreateDataSetWithPayment(clientDataSetId, payee, metadata,
-    ///      token, storagePricePerTibPerMonth). token 0 or `defaultToken` is the default currency; any other
-    ///      token must be whitelisted and enabled. The price is in that token's units; 0 means the posted price.
-    ///      Session keys: choosing a currency at the posted price needs only the CreateDataSet permission
-    ///      (FilecoinPay operator approvals are per token); signing a price needs CreateDataSetWithPayment.
+    /// @notice Verifies the payer's signature over data set creation extraData in any of its three variants,
+    ///         resolves the payment currency (#618) and records the agreed storage price (#619).
+    /// @dev The variant is identified by the ABI offset of `keys`, the first dynamic field:
+    ///      - 0xa0 legacy `(payer, clientDataSetId, keys, values, signature)`, signed as CreateDataSet; default token.
+    ///      - 0xc0 `(..., signature, address token)`, signed as CreateDataSetWithCurrency.
+    ///      - 0xe0 `(..., signature, address token, uint256 storagePricePerTibPerMonth)`, signed as
+    ///        CreateDataSetWithPayment. The price is 18-decimal USD per TiB per month; 0 means the posted price.
+    ///      Each type hash is also the session-key permission for its variant, so a signature or a session key
+    ///      for one variant is never valid for another. Token 0 or `defaultToken` is the default currency and
+    ///      needs no provider opt-in; any other token must be whitelisted, enabled and listed in the provider's
+    ///      `paymentTokens` registry capability.
     /// @return token The rail token
-    /// @return currencyCode Value for DataSetInfo.currency: whitelist id | (18 - decimals) << 8
     function verifyCreateDataSet(
         bytes calldata extraData,
         uint256 dataSetId,
         address payee,
+        uint256 providerId,
         address defaultToken,
-        uint16 defaultCurrencyCode,
         bytes32 domainSeparator,
         SessionKeyRegistry sessionKeyRegistry
-    ) public returns (address token, uint16 currencyCode) {
-        (address payer, uint256 clientDataSetId, string[] memory keys, string[] memory values,) =
-            abi.decode(extraData, (address, uint256, string[], string[], bytes));
-        bytes32 metadataHash = _hashMetadataEntriesMemory(keys, values);
-        // The signature as a calldata slice, for recoverSigner.
+    ) public returns (address token) {
+        uint256 keysOffset = uint256(bytes32(extraData[64:96]));
+        address payer;
+        uint256 clientDataSetId;
+        string[] memory keys;
+        string[] memory values;
+        uint256 storagePricePerTibPerMonth;
+        bytes32 typeHash;
+        if (keysOffset == LEGACY_KEYS_OFFSET) {
+            (payer, clientDataSetId, keys, values,) =
+                abi.decode(extraData, (address, uint256, string[], string[], bytes));
+            typeHash = CREATE_DATA_SET_TYPEHASH;
+        } else if (keysOffset == CREATE_DATA_SET_WITH_CURRENCY_KEYS_OFFSET) {
+            (payer, clientDataSetId, keys, values,, token) =
+                abi.decode(extraData, (address, uint256, string[], string[], bytes, address));
+            typeHash = CREATE_DATA_SET_WITH_CURRENCY_TYPEHASH;
+        } else if (keysOffset == CREATE_DATA_SET_WITH_PAYMENT_KEYS_OFFSET) {
+            (payer, clientDataSetId, keys, values,, token, storagePricePerTibPerMonth) =
+                abi.decode(extraData, (address, uint256, string[], string[], bytes, address, uint256));
+            typeHash = CREATE_DATA_SET_WITH_PAYMENT_TYPEHASH;
+        } else {
+            revert Errors.UnsupportedExtraDataVariant(keysOffset);
+        }
+        bytes memory structData = abi.encode(typeHash, clientDataSetId, payee, _hashMetadataEntriesMemory(keys, values));
+        if (keysOffset == CREATE_DATA_SET_WITH_CURRENCY_KEYS_OFFSET) {
+            structData = abi.encodePacked(structData, uint256(uint160(token)));
+        } else if (keysOffset == CREATE_DATA_SET_WITH_PAYMENT_KEYS_OFFSET) {
+            structData = abi.encodePacked(structData, uint256(uint160(token)), storagePricePerTibPerMonth);
+        }
+        // The signature (fifth field in every variant) as a calldata slice, for recoverSigner.
         uint256 sigOffset = uint256(bytes32(extraData[128:160]));
         uint256 sigLength = uint256(bytes32(extraData[sigOffset:sigOffset + 32]));
-        bytes calldata signature = extraData[sigOffset + 32:sigOffset + 32 + sigLength];
-
-        if (uint256(bytes32(extraData[64:96])) != CREATE_DATA_SET_WITH_PAYMENT_KEYS_OFFSET) {
-            _verifySignature(
-                payer,
-                signature,
-                _toTypedDataHash(
-                    domainSeparator,
-                    keccak256(abi.encode(CREATE_DATA_SET_TYPEHASH, clientDataSetId, payee, metadataHash))
-                ),
-                CREATE_DATA_SET_TYPEHASH,
-                sessionKeyRegistry
-            );
-            return (defaultToken, defaultCurrencyCode);
-        }
-
-        uint256 storagePricePerTibPerMonth;
-        (token, storagePricePerTibPerMonth) = abi.decode(extraData[160:224], (address, uint256));
         _verifySignature(
             payer,
-            signature,
-            _toTypedDataHash(
-                domainSeparator,
-                keccak256(
-                    abi.encode(
-                        CREATE_DATA_SET_WITH_PAYMENT_TYPEHASH,
-                        clientDataSetId,
-                        payee,
-                        metadataHash,
-                        token,
-                        storagePricePerTibPerMonth
-                    )
-                )
-            ),
-            storagePricePerTibPerMonth == 0 ? CREATE_DATA_SET_TYPEHASH : CREATE_DATA_SET_WITH_PAYMENT_TYPEHASH,
+            extraData[sigOffset + 32:sigOffset + 32 + sigLength],
+            _toTypedDataHash(domainSeparator, keccak256(structData)),
+            typeHash,
             sessionKeyRegistry
         );
+
         if (token == address(0) || token == defaultToken) {
             token = defaultToken;
-            currencyCode = defaultCurrencyCode;
         } else {
-            currencyCode = CurrencyRegistry.resolve(token);
+            PaymentTerms.pricing(dataSetId).currencyId = _resolveCurrency(token, providerId);
         }
-        DataSetPricing.setPrice(dataSetId, storagePricePerTibPerMonth, CurrencyRegistry.scale(currencyCode));
+        if (keysOffset == CREATE_DATA_SET_WITH_PAYMENT_KEYS_OFFSET) {
+            PaymentTerms.setPrice(dataSetId, storagePricePerTibPerMonth);
+        }
+    }
+
+    /// @dev Whitelist id of an enabled, non-default token that the provider lists in its `paymentTokens`
+    ///      capability (20-byte addresses, packed).
+    function _resolveCurrency(address token, uint256 providerId) private view returns (uint8) {
+        PaymentTermsStorage.FWSSCurrencyStorage storage $ = PaymentTerms.currencies();
+        uint256 currencyId = $.ids[token];
+        require(currencyId != 0 && $.currencies[currencyId].enabled, Errors.UnsupportedCurrency(token));
+
+        string[] memory capabilityKeys = new string[](1);
+        capabilityKeys[0] = PAYMENT_TOKENS_CAPABILITY_KEY;
+        bytes memory accepted = IServiceProviderRegistryHolder(address(this)).serviceProviderRegistry()
+            .getProductCapabilities(providerId, ServiceProviderRegistryStorage.ProductType.PDP, capabilityKeys)[0];
+        for (uint256 i = 0; i + 20 <= accepted.length; i += 20) {
+            address listed;
+            assembly ("memory-safe") {
+                listed := shr(96, mload(add(add(accepted, 0x20), i)))
+            }
+            if (listed == token) return uint8(currencyId);
+        }
+        revert Errors.CurrencyNotAcceptedByProvider(providerId, token);
     }
 
     function _hashMetadataEntriesMemory(string[] memory keys, string[] memory values) private pure returns (bytes32) {
@@ -399,19 +432,21 @@ library SignatureVerificationLib {
     /// @notice Verifies and authorizes an UpdateStoragePrice operation.
     /// @dev Internal: compiled into Rails.updateStoragePrice, which runs in the FWSS proxy's context, so the
     ///      authorizer reentrancy latch below shares the proxy's transient slot as for the other operations.
+    ///      The caller checks `deadline` against the current block.
     function verifyUpdateStoragePriceAuthorization(
         address payer,
         uint256 dataSetId,
         address authorizer,
         uint256 nonce,
         uint256 storagePricePerTibPerMonth,
+        uint256 deadline,
         bytes calldata signature,
         bytes32 domainSeparator,
         SessionKeyRegistry sessionKeyRegistry
     ) internal {
         bytes32 digest = _toTypedDataHash(
             domainSeparator,
-            keccak256(abi.encode(UPDATE_STORAGE_PRICE_TYPEHASH, dataSetId, nonce, storagePricePerTibPerMonth))
+            keccak256(abi.encode(UPDATE_STORAGE_PRICE_TYPEHASH, dataSetId, nonce, storagePricePerTibPerMonth, deadline))
         );
 
         if (authorizer == address(0)) {
@@ -426,7 +461,7 @@ library SignatureVerificationLib {
             UPDATE_STORAGE_PRICE_TYPEHASH,
             dataSetId,
             authorizer,
-            abi.encode(nonce, storagePricePerTibPerMonth)
+            abi.encode(nonce, storagePricePerTibPerMonth, deadline)
         );
     }
 

@@ -8,14 +8,19 @@ import {
     DATASET_FEE_PER_MONTH,
     SERVICE_COMMISSION_BPS,
     STORAGE_PRICE_PER_TIB_PER_MONTH,
-    priceList
+    TOKEN_DECIMALS,
+    priceList,
+    toTokenUnits
 } from "./PriceListUSDFC.sol";
 import {PriceList} from "./PriceList.sol";
-import {CURRENCY_REGISTRY_SLOT} from "./CurrencyRegistry.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "./FilecoinWarmStorageServiceLayout.sol" as StorageLayout;
-import {DATA_SET_PRICING_STORAGE_SLOT} from "./DataSetPricing.sol";
+import {
+    FWSS_CURRENCY_STORAGE_SLOT,
+    FWSS_DATA_SET_PRICING_STORAGE_SLOT,
+    PRICE_DECIMALS
+} from "./PaymentTermsStorage.sol";
 
 // bytes32(bytes4(keccak256(abi.encodePacked("extsloadStruct(bytes32,uint256)"))));
 bytes32 constant EXTSLOAD_STRUCT_SELECTOR = 0x5379a43500000000000000000000000000000000000000000000000000000000;
@@ -133,7 +138,9 @@ library FilecoinWarmStorageServiceStateLibrary {
         info.clientDataSetId = uint256(info11[7]);
         info.pdpEndEpoch = uint256(info11[8]);
         info.providerId = uint256(info11[9]);
-        info.pendingOneTimePayments = uint96(uint256(info11[10]));
+        // Stored in 18-decimal USD (#618); reported in the data set's token units, as it is paid
+        info.pendingOneTimePayments =
+            uint96(toTokenUnits(uint96(uint256(info11[10])), _dataSetCurrencyScale(service, dataSetId)));
         info.lifecycleReserveBalance = uint96(uint256(info11[10]) >> 96);
         info.dataSetId = dataSetId;
     }
@@ -248,7 +255,7 @@ library FilecoinWarmStorageServiceStateLibrary {
      * @notice Client-agreed storage price of a data set
      * @param service The service contract
      * @param dataSetId The data set ID
-     * @return storagePricePerTibPerMonth Agreed price in the data set's token units; 0 means the posted price
+     * @return storagePricePerTibPerMonth Agreed price in 18-decimal USD; 0 means the posted price (effective price is max(agreed, posted))
      * @return nonce Accepted price updates so far; the next UpdateStoragePrice signature signs this value
      */
     function getDataSetStoragePrice(FilecoinWarmStorageService service, uint256 dataSetId)
@@ -256,7 +263,7 @@ library FilecoinWarmStorageServiceStateLibrary {
         view
         returns (uint256 storagePricePerTibPerMonth, uint256 nonce)
     {
-        uint256 word = uint256(service.extsload(keccak256(abi.encode(dataSetId, DATA_SET_PRICING_STORAGE_SLOT))));
+        uint256 word = uint256(service.extsload(keccak256(abi.encode(dataSetId, FWSS_DATA_SET_PRICING_STORAGE_SLOT))));
         storagePricePerTibPerMonth = uint128(word);
         nonce = uint64(word >> 128);
     }
@@ -623,14 +630,14 @@ library FilecoinWarmStorageServiceStateLibrary {
      * @notice Number of whitelisted currencies (ids 1..count; id 0 is the default token)
      */
     function getCurrencyCount(FilecoinWarmStorageService service) public view returns (uint256) {
-        return uint256(service.extsload(CURRENCY_REGISTRY_SLOT));
+        return uint256(service.extsload(FWSS_CURRENCY_STORAGE_SLOT));
     }
 
     /**
      * @notice Whitelist id of a token; 0 for the default token or a token never whitelisted
      */
     function getCurrencyId(FilecoinWarmStorageService service, address token) public view returns (uint256) {
-        return uint256(service.extsload(keccak256(abi.encode(token, uint256(CURRENCY_REGISTRY_SLOT) + 2))));
+        return uint256(service.extsload(keccak256(abi.encode(token, uint256(FWSS_CURRENCY_STORAGE_SLOT) + 2))));
     }
 
     /**
@@ -648,7 +655,8 @@ library FilecoinWarmStorageServiceStateLibrary {
             IERC20Metadata defaultToken = service.usdfcTokenAddress();
             return (address(defaultToken), defaultToken.decimals(), true);
         }
-        uint256 word = uint256(service.extsload(keccak256(abi.encode(currencyId, uint256(CURRENCY_REGISTRY_SLOT) + 1))));
+        uint256 word =
+            uint256(service.extsload(keccak256(abi.encode(currencyId, uint256(FWSS_CURRENCY_STORAGE_SLOT) + 1))));
         token = address(uint160(word));
         decimals = uint8(word >> 160);
         enabled = uint8(word >> 168) != 0;
@@ -662,8 +670,7 @@ library FilecoinWarmStorageServiceStateLibrary {
         view
         returns (address token, uint8 decimals)
     {
-        bytes32 slot = bytes32(uint256(keccak256(abi.encode(dataSetId, StorageLayout.DATA_SET_INFO_SLOT))) + 10);
-        (token, decimals,) = getCurrency(service, uint8(uint256(service.extsload(slot)) >> 192));
+        (token, decimals,) = getCurrency(service, _dataSetCurrencyId(service, dataSetId));
     }
 
     /**
@@ -678,21 +685,41 @@ library FilecoinWarmStorageServiceStateLibrary {
         uint256 currencyId = getCurrencyId(service, token);
         (address currencyToken, uint8 decimals,) = getCurrency(service, currencyId);
         require(currencyToken == token, Errors.UnsupportedCurrency(token));
-        uint256 scale = 10 ** (18 - decimals);
+        uint256 scale = 10 ** (PRICE_DECIMALS - decimals);
         list = priceList();
         list.token = IERC20(token);
-        list.rates.storagePerTibPerMonth /= scale;
-        list.rates.datasetFeePerMonth /= scale;
-        list.rates.cdnEgressPerTib /= scale;
-        list.rates.cacheMissEgressPerTib /= scale;
-        list.fees.createDataSetFee /= scale;
-        list.fees.addPiecesBaseFee /= scale;
-        list.fees.addPiecesPerPieceFee /= scale;
-        list.fees.schedulePieceRemovalsFee /= scale;
-        list.fees.terminateFee /= scale;
-        list.lockups.lifecycleReserveTarget /= scale;
-        list.lockups.replenishThreshold /= scale;
-        list.lockups.cdnLockupAmount /= scale;
-        list.lockups.cacheMissLockupAmount /= scale;
+        list.rates.storagePerTibPerMonth = toTokenUnits(list.rates.storagePerTibPerMonth, scale);
+        list.rates.datasetFeePerMonth = toTokenUnits(list.rates.datasetFeePerMonth, scale);
+        list.rates.cdnEgressPerTib = toTokenUnits(list.rates.cdnEgressPerTib, scale);
+        list.rates.cacheMissEgressPerTib = toTokenUnits(list.rates.cacheMissEgressPerTib, scale);
+        list.fees.createDataSetFee = toTokenUnits(list.fees.createDataSetFee, scale);
+        list.fees.addPiecesBaseFee = toTokenUnits(list.fees.addPiecesBaseFee, scale);
+        list.fees.addPiecesPerPieceFee = toTokenUnits(list.fees.addPiecesPerPieceFee, scale);
+        list.fees.schedulePieceRemovalsFee = toTokenUnits(list.fees.schedulePieceRemovalsFee, scale);
+        list.fees.terminateFee = toTokenUnits(list.fees.terminateFee, scale);
+        list.lockups.lifecycleReserveTarget = toTokenUnits(list.lockups.lifecycleReserveTarget, scale);
+        list.lockups.replenishThreshold = toTokenUnits(list.lockups.replenishThreshold, scale);
+        list.lockups.cdnLockupAmount = toTokenUnits(list.lockups.cdnLockupAmount, scale);
+        list.lockups.cacheMissLockupAmount = toTokenUnits(list.lockups.cacheMissLockupAmount, scale);
+    }
+
+    function _dataSetCurrencyId(FilecoinWarmStorageService service, uint256 dataSetId) private view returns (uint256) {
+        return
+            uint8(
+                uint256(service.extsload(keccak256(abi.encode(dataSetId, FWSS_DATA_SET_PRICING_STORAGE_SLOT)))) >> 192
+            );
+    }
+
+    /// @dev Divisor from 18-decimal USD to the units of a data set's token.
+    function _dataSetCurrencyScale(FilecoinWarmStorageService service, uint256 dataSetId)
+        private
+        view
+        returns (uint256)
+    {
+        uint256 currencyId = _dataSetCurrencyId(service, dataSetId);
+        if (currencyId == 0) return 10 ** (PRICE_DECIMALS - TOKEN_DECIMALS);
+        uint256 word =
+            uint256(service.extsload(keccak256(abi.encode(currencyId, uint256(FWSS_CURRENCY_STORAGE_SLOT) + 1))));
+        return 10 ** (PRICE_DECIMALS - uint8(word >> 160));
     }
 }

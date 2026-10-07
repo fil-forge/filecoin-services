@@ -6,20 +6,18 @@ import {FilecoinPayV1} from "@fws-payments/FilecoinPayV1.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {IPDPVerifier} from "@pdp/interfaces/IPDPVerifier.sol";
+import {FilecoinWarmStorageService} from "../FilecoinWarmStorageService.sol";
+import {SignatureVerificationLib} from "./SignatureVerificationLib.sol";
 import {
     CurrencyAdded,
     CurrencyEnabledSet,
-    CurrencyRegistry,
-    CurrencyRegistryStorage,
-    Currency,
-    MAX_CURRENCY_DECIMALS,
+    DATA_SET_AUTHORIZER_ROOT_SLOT,
     MIN_CURRENCY_DECIMALS,
-    DATA_SET_INFO_ROOT_SLOT
-} from "./CurrencyRegistry.sol";
-
-interface IDefaultCurrency {
-    function usdfcTokenAddress() external view returns (address);
-}
+    PRICE_DECIMALS,
+    PaymentTerms,
+    PaymentTermsStorage
+} from "./PaymentTermsStorage.sol";
 import {
     CDN_LOCKUP_PERIOD,
     DATASET_FEE_PER_EPOCH,
@@ -30,13 +28,11 @@ import {
     EPOCHS_PER_MONTH,
     LIFECYCLE_RESERVE_TARGET,
     REPLENISH_THRESHOLD,
+    CREATE_DATA_SET_FEE,
     SERVICE_COMMISSION_BPS,
-    calculateStorageRateAtPrice
+    calculateStorageRateAtPrice,
+    toTokenUnits
 } from "./PriceListUSDFC.sol";
-import {DataSetPricing, DATA_SET_AUTHORIZER_ROOT_SLOT} from "./DataSetPricing.sol";
-import {SignatureVerificationLib} from "./SignatureVerificationLib.sol";
-import {FilecoinWarmStorageService} from "../FilecoinWarmStorageService.sol";
-import {IPDPVerifier} from "@pdp/interfaces/IPDPVerifier.sol";
 
 event CDNPaymentRailsToppedUp(
     uint256 indexed dataSetId,
@@ -63,7 +59,7 @@ library Rails {
     /// @param usdfcTokenAddress The USDFC token used for deposits and operator approvals
     /// @param payer The address of the payer
     /// @param includeCDN Whether to include fixed CDN/cache-miss lockups in the requirement checks
-    /// @param scale Divisor from the 18-decimal price list to the token's units
+    /// @param scale 10 ** (18 - token decimals); amounts are converted with `toTokenUnits` (#618)
     function validatePayerOperatorApprovalAndFunds(
         FilecoinPayV1 payments,
         IERC20 usdfcTokenAddress,
@@ -82,9 +78,8 @@ library Rails {
         if (includeCDN) {
             requiredLockup += DEFAULT_CACHE_MISS_LOCKUP_AMOUNT + DEFAULT_CDN_LOCKUP_AMOUNT;
         }
-        // Every term is a whole number of 10**12 units, so dividing the sum is exact
-        requiredLockup /= scale;
-        uint256 datasetFeePerEpoch = DATASET_FEE_PER_EPOCH / scale;
+        requiredLockup = toTokenUnits(requiredLockup, scale);
+        uint256 datasetFeePerEpoch = toTokenUnits(DATASET_FEE_PER_EPOCH, scale);
 
         // Check that payer has sufficient available funds
         (,, uint256 availableFunds,) = payments.getAccountInfoIfSettled(usdfcTokenAddress, payer);
@@ -124,8 +119,15 @@ library Rails {
         );
     }
 
+    /// @notice Creates the data set's rails in its payment token and seeds its fee bookkeeping.
+    /// @dev Writes `info.lifecycleReserveBalance` (token units, mirrors the rail's lockupFixed) and
+    ///      `info.pendingOneTimePayments` (the create fee, in 18-decimal USD like every pending fee; converted
+    ///      to token units when flushed). The data set's currency was recorded by
+    ///      SignatureVerificationLib.verifyCreateDataSet. CDN is only available in the default token: FilBeam
+    ///      settles CDN rails in default-token amounts.
     function createRails(
         FilecoinPayV1 payments,
+        FilecoinWarmStorageService.DataSetInfo storage info,
         uint256 dataSetId,
         IERC20 usdfcTokenAddress,
         address payer,
@@ -133,7 +135,10 @@ library Rails {
         address filBeamBeneficiaryAddress
     ) public returns (uint256 pdpRailId, uint256 cacheMissRailId, uint256 cdnRailId) {
         bool hasCDN = filBeamBeneficiaryAddress != address(0);
-        uint256 scale = currencyScale(dataSetId);
+        if (hasCDN && PaymentTerms.pricing(dataSetId).currencyId != 0) {
+            revert Errors.CDNNotSupportedForCurrency(address(usdfcTokenAddress));
+        }
+        uint256 scale = PaymentTerms.scale(dataSetId);
         // Validate payer has sufficient funds and operator approvals to cover the required lockup
         // If CDN is enabled, validation must account for the additional fixed lockup amounts
         validatePayerOperatorApprovalAndFunds(payments, usdfcTokenAddress, payer, hasCDN, scale);
@@ -148,7 +153,10 @@ library Rails {
         );
 
         // Set lockup period and seed the lifecycle reserve
-        payments.modifyRailLockup(pdpRailId, DEFAULT_LOCKUP_PERIOD, LIFECYCLE_RESERVE_TARGET / scale);
+        uint256 reserve = toTokenUnits(LIFECYCLE_RESERVE_TARGET, scale);
+        payments.modifyRailLockup(pdpRailId, DEFAULT_LOCKUP_PERIOD, reserve);
+        info.lifecycleReserveBalance = uint96(reserve);
+        info.pendingOneTimePayments = uint96(CREATE_DATA_SET_FEE);
 
         cacheMissRailId = 0;
         cdnRailId = 0;
@@ -162,8 +170,7 @@ library Rails {
                 0, // no service commission
                 address(this) // controller
             );
-            uint256 cacheMissLockup = DEFAULT_CACHE_MISS_LOCKUP_AMOUNT / scale;
-            payments.modifyRailLockup(cacheMissRailId, CDN_LOCKUP_PERIOD, cacheMissLockup);
+            payments.modifyRailLockup(cacheMissRailId, CDN_LOCKUP_PERIOD, DEFAULT_CACHE_MISS_LOCKUP_AMOUNT);
 
             cdnRailId = payments.createRail(
                 usdfcTokenAddress, // token address
@@ -173,10 +180,15 @@ library Rails {
                 0, // no service commission
                 address(this) // controller
             );
-            uint256 cdnLockup = DEFAULT_CDN_LOCKUP_AMOUNT / scale;
-            payments.modifyRailLockup(cdnRailId, CDN_LOCKUP_PERIOD, cdnLockup);
+            payments.modifyRailLockup(cdnRailId, CDN_LOCKUP_PERIOD, DEFAULT_CDN_LOCKUP_AMOUNT);
 
-            emit CDNPaymentRailsToppedUp(dataSetId, cdnLockup, cdnLockup, cacheMissLockup, cacheMissLockup);
+            emit CDNPaymentRailsToppedUp(
+                dataSetId,
+                DEFAULT_CDN_LOCKUP_AMOUNT,
+                DEFAULT_CDN_LOCKUP_AMOUNT,
+                DEFAULT_CACHE_MISS_LOCKUP_AMOUNT,
+                DEFAULT_CACHE_MISS_LOCKUP_AMOUNT
+            );
         }
     }
 
@@ -293,7 +305,23 @@ library Rails {
     // Replenishes the rail's fixed lockup when the reserve would drop below REPLENISH_THRESHOLD
     // after paying pending. Returns the new lockupFixed value (mirrors lifecycleReserveBalance).
     // Skipped for terminated rails (pdpEndEpoch != 0): modifyRailLockup forbids increases there.
+    // `pending` is in 18-decimal USD; the reserve and the returned value are in the data set's token units.
     function replenishReserveIfNeeded(
+        FilecoinPayV1 payments,
+        uint256 dataSetId,
+        uint256 pdpRailId,
+        uint256 pdpEndEpoch,
+        uint96 reserveBalance,
+        uint96 pending
+    ) public returns (uint96) {
+        uint256 scale = PaymentTerms.scale(dataSetId);
+        return _replenishReserveIfNeeded(
+            payments, pdpRailId, pdpEndEpoch, reserveBalance, uint96(toTokenUnits(pending, scale)), scale
+        );
+    }
+
+    /// @dev As `replenishReserveIfNeeded`, with `pending` already in token units.
+    function _replenishReserveIfNeeded(
         FilecoinPayV1 payments,
         uint256 pdpRailId,
         uint256 pdpEndEpoch,
@@ -301,14 +329,16 @@ library Rails {
         uint96 pending,
         uint256 scale
     ) internal returns (uint96) {
-        if (pdpEndEpoch == 0 && reserveBalance < pending + uint96(REPLENISH_THRESHOLD / scale)) {
-            uint96 newLockup = uint96(LIFECYCLE_RESERVE_TARGET / scale) + pending;
+        if (pdpEndEpoch == 0 && reserveBalance < pending + uint96(toTokenUnits(REPLENISH_THRESHOLD, scale))) {
+            uint96 newLockup = uint96(toTokenUnits(LIFECYCLE_RESERVE_TARGET, scale)) + pending;
             payments.modifyRailLockup(pdpRailId, DEFAULT_LOCKUP_PERIOD, newLockup);
             return newLockup;
         }
         return reserveBalance;
     }
 
+    /// @dev `pending` is in 18-decimal USD and is paid in the data set's token units, rounded up. The rate uses
+    ///      the data set's effective price (max of agreed and posted, #619), each term rounded up to token units.
     function updateStorageRates(
         FilecoinPayV1 payments,
         uint256 dataSetId,
@@ -319,16 +349,17 @@ library Rails {
         uint256 pdpEndEpoch,
         bool immediateTermination
     ) public returns (uint96 newReserveBalance) {
-        uint256 scale = currencyScale(dataSetId);
+        uint256 scale = PaymentTerms.scale(dataSetId);
         uint256 newStorageRatePerEpoch =
-            calculateStorageRateAtPrice(leafCount, DataSetPricing.effectiveStoragePrice(dataSetId, scale), scale);
+            calculateStorageRateAtPrice(leafCount, PaymentTerms.effectiveStoragePrice(dataSetId), scale);
+        pending = uint96(toTokenUnits(pending, scale));
         if (immediateTermination) {
             // No try/catch: immediateTermination implies the payer consented and is solvent.
             payments.modifyRailLockup(pdpRailId, 0, pending);
             newReserveBalance = 0;
         } else {
             uint96 replenished =
-                replenishReserveIfNeeded(payments, pdpRailId, pdpEndEpoch, reserveBalance, pending, scale);
+                _replenishReserveIfNeeded(payments, pdpRailId, pdpEndEpoch, reserveBalance, pending, scale);
             if (replenished < pending) {
                 pending = replenished;
             }
@@ -336,19 +367,6 @@ library Rails {
         }
         payments.modifyRailPayment(pdpRailId, newStorageRatePerEpoch, pending);
         emit RailRateUpdated(dataSetId, pdpRailId, newStorageRatePerEpoch);
-    }
-
-    /// @notice Divisor from the 18-decimal price list to a data set's token units.
-    /// @dev Reads the decimal shift in `DataSetInfo.currency` (struct slot 10, bits 200-207) from FWSS storage;
-    ///      Rails functions run by DELEGATECALL in FWSS's context. Zero (every pre-#618 data set) is 1.
-    function currencyScale(uint256 dataSetId) internal view returns (uint256 scale) {
-        bytes32 baseSlot = DATA_SET_INFO_ROOT_SLOT;
-        assembly ("memory-safe") {
-            mstore(0, dataSetId)
-            mstore(0x20, baseSlot)
-            let shift := and(shr(200, sload(add(keccak256(0, 0x40), 10))), 0xff) // currency code bits 8-15
-            scale := exp(10, shift)
-        }
     }
 
     // ---------------------------------------------------------------------
@@ -364,20 +382,24 @@ library Rails {
             owner := sload(0x9016d09d72d40fdae2fd8ceac6b6234c7706214fd39c1cd1e609a0528c199300)
         }
         require(msg.sender == owner, OwnableUpgradeable.OwnableUnauthorizedAccount(msg.sender));
-        CurrencyRegistryStorage storage $ = CurrencyRegistry.layout();
+        PaymentTermsStorage.FWSSCurrencyStorage storage $ = PaymentTerms.currencies();
         uint256 currencyId = $.ids[token];
         if (currencyId == 0) {
-            require(token != IDefaultCurrency(address(this)).usdfcTokenAddress(), Errors.CurrencyAlreadyAdded(token));
+            require(
+                token != address(FilecoinWarmStorageService(address(this)).usdfcTokenAddress()),
+                Errors.CurrencyAlreadyAdded(token)
+            );
             uint8 decimals = IERC20Metadata(token).decimals();
             require(
-                decimals >= MIN_CURRENCY_DECIMALS && decimals <= MAX_CURRENCY_DECIMALS,
+                decimals >= MIN_CURRENCY_DECIMALS && decimals <= PRICE_DECIMALS,
                 Errors.InvalidCurrencyDecimals(token, decimals)
             );
             currencyId = $.count + 1;
             require(currencyId <= type(uint8).max, Errors.TooManyCurrencies());
             $.count = currencyId;
             $.ids[token] = currencyId;
-            $.currencies[currencyId] = Currency({token: token, decimals: decimals, enabled: enabled});
+            $.currencies[currencyId] =
+                PaymentTermsStorage.Currency({token: token, decimals: decimals, enabled: enabled});
             emit CurrencyAdded(uint8(currencyId), token, decimals);
         } else {
             $.currencies[currencyId].enabled = enabled;
@@ -389,11 +411,14 @@ library Rails {
     /// @dev Body of FilecoinWarmStorageService.updateStoragePrice, kept here so the FWSS core carries only a
     ///      forwarding stub. Runs by DELEGATECALL in the proxy: msg.sender is the original caller, `info` is
     ///      the proxy's DataSetInfo, and immutables are read back through the proxy's public getters.
+    ///      The service provider submits; the payer (its session key, or the data set's authorizer) signs
+    ///      UpdateStoragePrice(dataSetId, nonce, storagePricePerTibPerMonth, deadline).
     function updateStoragePrice(
         FilecoinWarmStorageService.DataSetInfo storage info,
         uint256 dataSetId,
         uint256 storagePricePerTibPerMonth,
         uint256 nonce,
+        uint256 deadline,
         bytes calldata signature,
         bytes32 domainSeparator
     ) public {
@@ -412,6 +437,7 @@ library Rails {
         if (msg.sender != serviceProvider) {
             revert Errors.CallerNotServiceProvider(dataSetId, serviceProvider, msg.sender);
         }
+        if (block.number > deadline) revert Errors.StoragePriceUpdateExpired(dataSetId, deadline, block.number);
 
         FilecoinWarmStorageService self = FilecoinWarmStorageService(address(this));
         SignatureVerificationLib.verifyUpdateStoragePriceAuthorization(
@@ -420,11 +446,12 @@ library Rails {
             authorizer,
             nonce,
             storagePricePerTibPerMonth,
+            deadline,
             signature,
             domainSeparator,
             self.sessionKeyRegistry()
         );
-        DataSetPricing.updatePrice(dataSetId, storagePricePerTibPerMonth, nonce, currencyScale(dataSetId));
+        PaymentTerms.updatePrice(dataSetId, storagePricePerTibPerMonth, nonce);
 
         // Re-price now so an idle data set picks up the new price; applies from the next epoch.
         info.lifecycleReserveBalance = updateStorageRates(
