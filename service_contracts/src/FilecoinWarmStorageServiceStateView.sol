@@ -75,6 +75,18 @@ contract FilecoinWarmStorageServiceStateView is IPDPProvingSchedule {
         return service.getClientDataSetsLength(payer);
     }
 
+    function getCurrency(uint256 currencyId) external view returns (address token, uint8 decimals, bool enabled) {
+        return service.getCurrency(currencyId);
+    }
+
+    function getCurrencyCount() external view returns (uint256) {
+        return service.getCurrencyCount();
+    }
+
+    function getCurrencyId(address token) external view returns (uint256) {
+        return service.getCurrencyId(token);
+    }
+
     function getCurrentPricingRates() external view returns (uint256 storagePrice, uint256 datasetFee) {
         return service.getCurrentPricingRates();
     }
@@ -89,6 +101,10 @@ contract FilecoinWarmStorageServiceStateView is IPDPProvingSchedule {
 
     function getDataSetAuthorizer(uint256 dataSetId) external view returns (address) {
         return service.getDataSetAuthorizer(dataSetId);
+    }
+
+    function getDataSetCurrency(uint256 dataSetId) external view returns (address token, uint8 decimals) {
+        return service.getDataSetCurrency(dataSetId);
     }
 
     function getDataSetMetadata(uint256 dataSetId, string memory key)
@@ -130,6 +146,10 @@ contract FilecoinWarmStorageServiceStateView is IPDPProvingSchedule {
 
     function getPriceList() external view returns (PriceList memory list) {
         return service.getPriceList();
+    }
+
+    function getPriceListForCurrency(address token) external view returns (PriceList memory list) {
+        return service.getPriceListForCurrency(token);
     }
 
     function hasBeenProvenRecently(uint256 dataSetId) external view returns (bool) {

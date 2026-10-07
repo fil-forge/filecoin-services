@@ -264,6 +264,16 @@
               "encoding": "inplace",
               "numberOfBytes": "12"
             }
+          },
+          {
+            "label": "currency",
+            "slot": "10",
+            "offset": 24,
+            "type": {
+              "label": "uint16",
+              "encoding": "inplace",
+              "numberOfBytes": "2"
+            }
           }
         ]
       }

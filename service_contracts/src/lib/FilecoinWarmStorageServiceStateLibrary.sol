@@ -11,7 +11,9 @@ import {
     priceList
 } from "./PriceListUSDFC.sol";
 import {PriceList} from "./PriceList.sol";
+import {CURRENCY_REGISTRY_SLOT} from "./CurrencyRegistry.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "./FilecoinWarmStorageServiceLayout.sol" as StorageLayout;
 
 // bytes32(bytes4(keccak256(abi.encodePacked("extsloadStruct(bytes32,uint256)"))));
@@ -593,7 +595,86 @@ library FilecoinWarmStorageServiceStateLibrary {
      *      that want the complete price picture.
      */
     function getPriceList(FilecoinWarmStorageService service) public view returns (PriceList memory list) {
+        return getPriceListForCurrency(service, address(service.usdfcTokenAddress()));
+    }
+
+    // ---------------------------------------------------------------------
+    // Payment currencies (#618)
+
+    /**
+     * @notice Number of whitelisted currencies (ids 1..count; id 0 is the default token)
+     */
+    function getCurrencyCount(FilecoinWarmStorageService service) public view returns (uint256) {
+        return uint256(service.extsload(CURRENCY_REGISTRY_SLOT));
+    }
+
+    /**
+     * @notice Whitelist id of a token; 0 for the default token or a token never whitelisted
+     */
+    function getCurrencyId(FilecoinWarmStorageService service, address token) public view returns (uint256) {
+        return uint256(service.extsload(keccak256(abi.encode(token, uint256(CURRENCY_REGISTRY_SLOT) + 2))));
+    }
+
+    /**
+     * @notice A payment currency by id
+     * @return token The stablecoin (id 0: `usdfcTokenAddress`)
+     * @return decimals Its decimals; FWSS charges the USD price list scaled to them
+     * @return enabled Whether new data sets may pay in it
+     */
+    function getCurrency(FilecoinWarmStorageService service, uint256 currencyId)
+        public
+        view
+        returns (address token, uint8 decimals, bool enabled)
+    {
+        if (currencyId == 0) {
+            IERC20Metadata defaultToken = service.usdfcTokenAddress();
+            return (address(defaultToken), defaultToken.decimals(), true);
+        }
+        uint256 word = uint256(service.extsload(keccak256(abi.encode(currencyId, uint256(CURRENCY_REGISTRY_SLOT) + 1))));
+        token = address(uint160(word));
+        decimals = uint8(word >> 160);
+        enabled = uint8(word >> 168) != 0;
+    }
+
+    /**
+     * @notice The currency a data set pays in
+     */
+    function getDataSetCurrency(FilecoinWarmStorageService service, uint256 dataSetId)
+        public
+        view
+        returns (address token, uint8 decimals)
+    {
+        bytes32 slot = bytes32(uint256(keccak256(abi.encode(dataSetId, StorageLayout.DATA_SET_INFO_SLOT))) + 10);
+        (token, decimals,) = getCurrency(service, uint8(uint256(service.extsload(slot)) >> 192));
+    }
+
+    /**
+     * @notice The price catalogue in a given currency's units
+     * @dev Reverts with UnsupportedCurrency for a token that is neither the default nor whitelisted.
+     */
+    function getPriceListForCurrency(FilecoinWarmStorageService service, address token)
+        public
+        view
+        returns (PriceList memory list)
+    {
+        uint256 currencyId = getCurrencyId(service, token);
+        (address currencyToken, uint8 decimals,) = getCurrency(service, currencyId);
+        require(currencyToken == token, Errors.UnsupportedCurrency(token));
+        uint256 scale = 10 ** (18 - decimals);
         list = priceList();
-        list.token = IERC20(address(service.usdfcTokenAddress()));
+        list.token = IERC20(token);
+        list.rates.storagePerTibPerMonth /= scale;
+        list.rates.datasetFeePerMonth /= scale;
+        list.rates.cdnEgressPerTib /= scale;
+        list.rates.cacheMissEgressPerTib /= scale;
+        list.fees.createDataSetFee /= scale;
+        list.fees.addPiecesBaseFee /= scale;
+        list.fees.addPiecesPerPieceFee /= scale;
+        list.fees.schedulePieceRemovalsFee /= scale;
+        list.fees.terminateFee /= scale;
+        list.lockups.lifecycleReserveTarget /= scale;
+        list.lockups.replenishThreshold /= scale;
+        list.lockups.cdnLockupAmount /= scale;
+        list.lockups.cacheMissLockupAmount /= scale;
     }
 }

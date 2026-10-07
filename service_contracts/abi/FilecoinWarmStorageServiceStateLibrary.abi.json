@@ -400,6 +400,83 @@
   },
   {
     "type": "function",
+    "name": "getCurrency",
+    "inputs": [
+      {
+        "name": "service",
+        "type": "FilecoinWarmStorageService",
+        "internalType": "contract FilecoinWarmStorageService"
+      },
+      {
+        "name": "currencyId",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "token",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "decimals",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "enabled",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getCurrencyCount",
+    "inputs": [
+      {
+        "name": "service",
+        "type": "FilecoinWarmStorageService",
+        "internalType": "contract FilecoinWarmStorageService"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getCurrencyId",
+    "inputs": [
+      {
+        "name": "service",
+        "type": "FilecoinWarmStorageService",
+        "internalType": "contract FilecoinWarmStorageService"
+      },
+      {
+        "name": "token",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "getCurrentPricingRates",
     "inputs": [
       {
@@ -533,6 +610,35 @@
         "name": "",
         "type": "address",
         "internalType": "address"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getDataSetCurrency",
+    "inputs": [
+      {
+        "name": "service",
+        "type": "FilecoinWarmStorageService",
+        "internalType": "contract FilecoinWarmStorageService"
+      },
+      {
+        "name": "dataSetId",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "token",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "decimals",
+        "type": "uint8",
+        "internalType": "uint8"
       }
     ],
     "stateMutability": "view"
@@ -685,6 +791,133 @@
         "name": "service",
         "type": "FilecoinWarmStorageService",
         "internalType": "contract FilecoinWarmStorageService"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "list",
+        "type": "tuple",
+        "internalType": "struct PriceList",
+        "components": [
+          {
+            "name": "token",
+            "type": "IERC20",
+            "internalType": "contract IERC20"
+          },
+          {
+            "name": "rates",
+            "type": "tuple",
+            "internalType": "struct PriceListRates",
+            "components": [
+              {
+                "name": "storagePerTibPerMonth",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "datasetFeePerMonth",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "cdnEgressPerTib",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "cacheMissEgressPerTib",
+                "type": "uint256",
+                "internalType": "uint256"
+              }
+            ]
+          },
+          {
+            "name": "fees",
+            "type": "tuple",
+            "internalType": "struct PriceListFees",
+            "components": [
+              {
+                "name": "createDataSetFee",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "addPiecesBaseFee",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "addPiecesPerPieceFee",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "schedulePieceRemovalsFee",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "terminateFee",
+                "type": "uint256",
+                "internalType": "uint256"
+              }
+            ]
+          },
+          {
+            "name": "lockups",
+            "type": "tuple",
+            "internalType": "struct PriceListLockups",
+            "components": [
+              {
+                "name": "lifecycleReserveTarget",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "replenishThreshold",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "defaultLockupPeriod",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "cdnLockupAmount",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "cacheMissLockupAmount",
+                "type": "uint256",
+                "internalType": "uint256"
+              },
+              {
+                "name": "cdnLockupPeriod",
+                "type": "uint256",
+                "internalType": "uint256"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getPriceListForCurrency",
+    "inputs": [
+      {
+        "name": "service",
+        "type": "FilecoinWarmStorageService",
+        "internalType": "contract FilecoinWarmStorageService"
+      },
+      {
+        "name": "token",
+        "type": "address",
+        "internalType": "address"
       }
     ],
     "outputs": [
@@ -1047,6 +1280,17 @@
         "name": "dataSetId",
         "type": "uint256",
         "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "UnsupportedCurrency",
+    "inputs": [
+      {
+        "name": "token",
+        "type": "address",
+        "internalType": "address"
       }
     ]
   }
