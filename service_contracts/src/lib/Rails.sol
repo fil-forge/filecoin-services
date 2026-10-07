@@ -13,9 +13,9 @@ import {
     CurrencyRegistryStorage,
     Currency,
     MAX_CURRENCY_DECIMALS,
-    MIN_CURRENCY_DECIMALS
+    MIN_CURRENCY_DECIMALS,
+    DATA_SET_INFO_ROOT_SLOT
 } from "./CurrencyRegistry.sol";
-import {DATA_SET_INFO_ROOT_SLOT} from "./CurrencyRegistry.sol";
 
 interface IDefaultCurrency {
     function usdfcTokenAddress() external view returns (address);
@@ -334,7 +334,7 @@ library Rails {
     }
 
     /// @notice Divisor from the 18-decimal price list to a data set's token units.
-    /// @dev Reads `DataSetInfo.currencyShift` (slot 10 of the struct, bits 200-207) from FWSS storage;
+    /// @dev Reads the decimal shift in `DataSetInfo.currency` (struct slot 10, bits 200-207) from FWSS storage;
     ///      Rails functions run by DELEGATECALL in FWSS's context. Zero (every pre-#618 data set) is 1.
     function currencyScale(uint256 dataSetId) internal view returns (uint256 scale) {
         bytes32 baseSlot = DATA_SET_INFO_ROOT_SLOT;
