@@ -33,7 +33,7 @@ import {
     SERVICE_COMMISSION_BPS,
     calculateStorageRateAtPrice
 } from "./PriceListUSDFC.sol";
-import {DataSetPricing} from "./DataSetPricing.sol";
+import {DataSetPricing, DATA_SET_AUTHORIZER_ROOT_SLOT} from "./DataSetPricing.sol";
 import {SignatureVerificationLib} from "./SignatureVerificationLib.sol";
 import {FilecoinWarmStorageService} from "../FilecoinWarmStorageService.sol";
 import {IPDPVerifier} from "@pdp/interfaces/IPDPVerifier.sol";
@@ -395,9 +395,16 @@ library Rails {
         uint256 storagePricePerTibPerMonth,
         uint256 nonce,
         bytes calldata signature,
-        address authorizer,
         bytes32 domainSeparator
     ) public {
+        // The data set's authorizer (#536), read from FWSS storage to keep the core stub small
+        address authorizer;
+        bytes32 authorizerRoot = DATA_SET_AUTHORIZER_ROOT_SLOT;
+        assembly ("memory-safe") {
+            mstore(0, dataSetId)
+            mstore(0x20, authorizerRoot)
+            authorizer := sload(keccak256(0, 0x40))
+        }
         uint256 pdpRailId = info.pdpRailId;
         if (pdpRailId == 0) revert Errors.InvalidDataSetId(dataSetId);
         if (info.pdpEndEpoch != 0) revert Errors.DataSetPaymentAlreadyTerminated(dataSetId);

@@ -10,6 +10,11 @@ import {STORAGE_PRICE_PER_TIB_PER_MONTH} from "./PriceListUSDFC.sol";
 ///      Namespaced so it never collides with the root slots 0-23 that FWSSStorage freezes.
 bytes32 constant DATA_SET_PRICING_STORAGE_SLOT = 0xe60d4b8c9786d4bff16c61a200159c92875861d64c13f886bd854066b070bc00;
 
+/// @dev Root slot of FWSS's `dataSetAuthorizer` mapping. Mirrors the generated
+///      `FilecoinWarmStorageServiceLayout.DATA_SET_AUTHORIZER_SLOT` (which Rails cannot import: the layout
+///      generator compiles FWSS, which links Rails). Pinned by AdjustableStoragePriceTest.
+bytes32 constant DATA_SET_AUTHORIZER_ROOT_SLOT = bytes32(uint256(23));
+
 /// @notice The client-agreed storage price of a data set was set at creation or changed by mutual consent.
 /// @param dataSetId The data set ID
 /// @param storagePricePerTibPerMonth Agreed price in the data set's token units; 0 means the posted price

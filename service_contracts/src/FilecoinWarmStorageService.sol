@@ -1204,13 +1204,7 @@ contract FilecoinWarmStorageService is
         bytes calldata signature
     ) external {
         Rails.updateStoragePrice(
-            dataSetInfo[dataSetId],
-            dataSetId,
-            storagePricePerTibPerMonth,
-            nonce,
-            signature,
-            dataSetAuthorizer[dataSetId],
-            _domainSeparatorV4()
+            dataSetInfo[dataSetId], dataSetId, storagePricePerTibPerMonth, nonce, signature, _domainSeparatorV4()
         );
     }
 
