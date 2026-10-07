@@ -5,14 +5,6 @@ import {Cids} from "@pdp/Cids.sol";
 import {SessionKeyRegistry} from "@session-key-registry/SessionKeyRegistry.sol";
 import {Errors} from "../Errors.sol";
 import {IDataSetAuthorizer} from "../interfaces/IDataSetAuthorizer.sol";
-import {ServiceProviderRegistry} from "../ServiceProviderRegistry.sol";
-import {ServiceProviderRegistryStorage} from "../ServiceProviderRegistryStorage.sol";
-import {PAYMENT_TOKENS_CAPABILITY_KEY, PaymentTerms, PaymentTermsStorage} from "./PaymentTermsStorage.sol";
-
-/// @dev The FWSS getter used to reach the provider registry from library code running in FWSS's context.
-interface IServiceProviderRegistryHolder {
-    function serviceProviderRegistry() external view returns (ServiceProviderRegistry);
-}
 
 /// @dev ABI offsets of `keys` (the first dynamic field) in the create-data-set extraData variants: a five-word
 ///      head for the legacy tuple, six words with `address token` (#618), seven words with
@@ -328,33 +320,29 @@ library SignatureVerificationLib {
         return _verifyAuthorizer(payer, signature, digest, TERMINATE_SERVICE_TYPEHASH, dataSetId, authorizer, bytes(""));
     }
 
-    /// @notice Verifies the payer's signature over data set creation extraData in any of its three variants,
-    ///         resolves the payment currency (#618) and records the agreed storage price (#619).
+    /// @notice Verifies the payer's signature over data set creation extraData in any of its three variants and
+    ///         returns the signed payment terms. Verification only: the caller resolves the currency (#618) and
+    ///         records the price (#619).
     /// @dev The variant is identified by the ABI offset of `keys`, the first dynamic field:
-    ///      - 0xa0 legacy `(payer, clientDataSetId, keys, values, signature)`, signed as CreateDataSet; default token.
+    ///      - 0xa0 legacy `(payer, clientDataSetId, keys, values, signature)`, signed as CreateDataSet.
     ///      - 0xc0 `(..., signature, address token)`, signed as CreateDataSetWithCurrency.
     ///      - 0xe0 `(..., signature, address token, uint256 storagePricePerTibPerMonth)`, signed as
-    ///        CreateDataSetWithPayment. The price is 18-decimal USD per TiB per month; 0 means the posted price.
+    ///        CreateDataSetWithPayment.
     ///      Each type hash is also the session-key permission for its variant, so a signature or a session key
-    ///      for one variant is never valid for another. Token 0 or `defaultToken` is the default currency and
-    ///      needs no provider opt-in; any other token must be whitelisted, enabled and listed in the provider's
-    ///      `paymentTokens` registry capability.
-    /// @return token The rail token
+    ///      for one variant is never valid for another.
+    /// @return token The signed token; address(0) for the legacy variant (the default token)
+    /// @return storagePricePerTibPerMonth The signed price in 18-decimal USD per TiB per month; 0 means posted
     function verifyCreateDataSet(
         bytes calldata extraData,
-        uint256 dataSetId,
         address payee,
-        uint256 providerId,
-        address defaultToken,
         bytes32 domainSeparator,
         SessionKeyRegistry sessionKeyRegistry
-    ) public returns (address token) {
+    ) public view returns (address token, uint256 storagePricePerTibPerMonth) {
         uint256 keysOffset = uint256(bytes32(extraData[64:96]));
         address payer;
         uint256 clientDataSetId;
         string[] memory keys;
         string[] memory values;
-        uint256 storagePricePerTibPerMonth;
         bytes32 typeHash;
         if (keysOffset == LEGACY_KEYS_OFFSET) {
             (payer, clientDataSetId, keys, values,) =
@@ -387,36 +375,6 @@ library SignatureVerificationLib {
             typeHash,
             sessionKeyRegistry
         );
-
-        if (token == address(0) || token == defaultToken) {
-            token = defaultToken;
-        } else {
-            PaymentTerms.pricing(dataSetId).currencyId = _resolveCurrency(token, providerId);
-        }
-        if (keysOffset == CREATE_DATA_SET_WITH_PAYMENT_KEYS_OFFSET) {
-            PaymentTerms.setPrice(dataSetId, storagePricePerTibPerMonth);
-        }
-    }
-
-    /// @dev Whitelist id of an enabled, non-default token that the provider lists in its `paymentTokens`
-    ///      capability (20-byte addresses, packed).
-    function _resolveCurrency(address token, uint256 providerId) private view returns (uint8) {
-        PaymentTermsStorage.FWSSCurrencyStorage storage $ = PaymentTerms.currencies();
-        uint256 currencyId = $.ids[token];
-        require(currencyId != 0 && $.currencies[currencyId].enabled, Errors.UnsupportedCurrency(token));
-
-        string[] memory capabilityKeys = new string[](1);
-        capabilityKeys[0] = PAYMENT_TOKENS_CAPABILITY_KEY;
-        bytes memory accepted = IServiceProviderRegistryHolder(address(this)).serviceProviderRegistry()
-            .getProductCapabilities(providerId, ServiceProviderRegistryStorage.ProductType.PDP, capabilityKeys)[0];
-        for (uint256 i = 0; i + 20 <= accepted.length; i += 20) {
-            address listed;
-            assembly ("memory-safe") {
-                listed := shr(96, mload(add(add(accepted, 0x20), i)))
-            }
-            if (listed == token) return uint8(currencyId);
-        }
-        revert Errors.CurrencyNotAcceptedByProvider(providerId, token);
     }
 
     function _hashMetadataEntriesMemory(string[] memory keys, string[] memory values) private pure returns (bytes32) {
@@ -429,39 +387,32 @@ library SignatureVerificationLib {
         return keccak256(abi.encodePacked(entryHashes));
     }
 
-    /// @notice Verifies and authorizes an UpdateStoragePrice operation.
-    /// @dev Internal: compiled into Rails.updateStoragePrice, which runs in the FWSS proxy's context, so the
-    ///      authorizer reentrancy latch below shares the proxy's transient slot as for the other operations.
-    ///      The caller checks `deadline` against the current block.
-    function verifyUpdateStoragePriceAuthorization(
+    /// @notice Verifies the payer's signature (or a payer session key holding the UpdateStoragePrice permission)
+    ///         over an UpdateStoragePrice operation.
+    /// @dev The data set's authorizer (#536) is deliberately not consulted: UpdateStoragePrice spends payer funds
+    ///      without a storage obligation, and authorizer grants issued before it existed must not extend to it.
+    ///      Internal: compiled into Rails. The caller checks `deadline` (an epoch) against the current block.
+    function verifyUpdateStoragePriceSignature(
         address payer,
         uint256 dataSetId,
-        address authorizer,
         uint256 nonce,
         uint256 storagePricePerTibPerMonth,
         uint256 deadline,
         bytes calldata signature,
         bytes32 domainSeparator,
         SessionKeyRegistry sessionKeyRegistry
-    ) internal {
-        bytes32 digest = _toTypedDataHash(
-            domainSeparator,
-            keccak256(abi.encode(UPDATE_STORAGE_PRICE_TYPEHASH, dataSetId, nonce, storagePricePerTibPerMonth, deadline))
-        );
-
-        if (authorizer == address(0)) {
-            _verifySignature(payer, signature, digest, UPDATE_STORAGE_PRICE_TYPEHASH, sessionKeyRegistry);
-            return;
-        }
-
-        _verifyAuthorizer(
+    ) internal view {
+        _verifySignature(
             payer,
             signature,
-            digest,
+            _toTypedDataHash(
+                domainSeparator,
+                keccak256(
+                    abi.encode(UPDATE_STORAGE_PRICE_TYPEHASH, dataSetId, nonce, storagePricePerTibPerMonth, deadline)
+                )
+            ),
             UPDATE_STORAGE_PRICE_TYPEHASH,
-            dataSetId,
-            authorizer,
-            abi.encode(nonce, storagePricePerTibPerMonth, deadline)
+            sessionKeyRegistry
         );
     }
 

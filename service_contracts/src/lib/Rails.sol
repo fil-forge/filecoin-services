@@ -6,13 +6,13 @@ import {FilecoinPayV1} from "@fws-payments/FilecoinPayV1.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {SessionKeyRegistry} from "@session-key-registry/SessionKeyRegistry.sol";
 import {IPDPVerifier} from "@pdp/interfaces/IPDPVerifier.sol";
-import {FilecoinWarmStorageService} from "../FilecoinWarmStorageService.sol";
+import {ServiceProviderRegistry} from "../ServiceProviderRegistry.sol";
 import {SignatureVerificationLib} from "./SignatureVerificationLib.sol";
 import {
     CurrencyAdded,
     CurrencyEnabledSet,
-    DATA_SET_AUTHORIZER_ROOT_SLOT,
     MIN_CURRENCY_DECIMALS,
     PRICE_DECIMALS,
     PaymentTerms,
@@ -34,6 +34,34 @@ import {
     toTokenUnits
 } from "./PriceListUSDFC.sol";
 
+/// @dev Root slot of FWSS's `dataSetInfo` mapping: `FilecoinWarmStorageServiceLayout.DATA_SET_INFO_SLOT`, slot 7 of
+///      the frozen legacy layout (also slot 7 in the module branch's FWSSStorage). Rails cannot import the generated
+///      layout, which compiles FWSS, which links Rails. Pinned against the generated layout by MultiCurrencyTest.
+bytes32 constant DATA_SET_INFO_ROOT_SLOT = bytes32(uint256(7));
+
+/// @dev Field-for-field copy of FWSS's `DataSetInfo` (frozen upstream; `FWSSStorage.DataSetInfo` on the module
+///      branch), so Rails can read and write a data set's record without importing the FWSS contract.
+struct DataSetInfoRecord {
+    uint256 pdpRailId;
+    uint256 cacheMissRailId;
+    uint256 cdnRailId;
+    address payer;
+    address payee;
+    address serviceProvider;
+    uint256 commissionBps;
+    uint256 clientDataSetId;
+    uint256 pdpEndEpoch;
+    uint256 providerId;
+    uint96 pendingOneTimePayments; // 18-decimal USD
+    uint96 lifecycleReserveBalance; // token units
+}
+
+/// @dev The FWSS getters that stay routed after the ERC-8167 dispatch transition (upstream's IFWSSConfig).
+interface IFWSSConfig {
+    function paymentsContractAddress() external view returns (address);
+    function pdpVerifierAddress() external view returns (address);
+}
+
 event CDNPaymentRailsToppedUp(
     uint256 indexed dataSetId,
     uint256 cdnAmountAdded,
@@ -51,18 +79,28 @@ event DataSetAbandoned(uint256 indexed dataSetId, uint256 pdpRailId, uint256 cac
 event RailRateUpdated(uint256 indexed dataSetId, uint256 railId, uint256 newRate);
 
 library Rails {
+    /// @dev A data set's record in FWSS storage (Rails runs by DELEGATECALL in the FWSS proxy).
+    function dataSetInfo(uint256 dataSetId) internal pure returns (DataSetInfoRecord storage info) {
+        bytes32 root = DATA_SET_INFO_ROOT_SLOT;
+        assembly ("memory-safe") {
+            mstore(0, dataSetId)
+            mstore(0x20, root)
+            info.slot := keccak256(0, 0x40)
+        }
+    }
+
     /// @notice Validates the payer is set up to add pieces, not just create the dataset.
     /// @dev    The lifecycle reserve is consumed at creation; the per-dataset fee headroom is only
     ///         consumed once pieces are added. Empty datasets leave it as approved headroom.
     ///         Required up front intentionally: creation assumes pieces will follow.
     /// @param payments The FilecoinPayV1 contract instance
-    /// @param usdfcTokenAddress The USDFC token used for deposits and operator approvals
+    /// @param token The data set's payment token, used for deposits and operator approvals
     /// @param payer The address of the payer
     /// @param includeCDN Whether to include fixed CDN/cache-miss lockups in the requirement checks
     /// @param scale 10 ** (18 - token decimals); amounts are converted with `toTokenUnits` (#618)
     function validatePayerOperatorApprovalAndFunds(
         FilecoinPayV1 payments,
-        IERC20 usdfcTokenAddress,
+        IERC20 token,
         address payer,
         bool includeCDN,
         uint256 scale
@@ -82,7 +120,7 @@ library Rails {
         uint256 datasetFeePerEpoch = toTokenUnits(DATASET_FEE_PER_EPOCH, scale);
 
         // Check that payer has sufficient available funds
-        (,, uint256 availableFunds,) = payments.getAccountInfoIfSettled(usdfcTokenAddress, payer);
+        (,, uint256 availableFunds,) = payments.getAccountInfoIfSettled(token, payer);
         require(availableFunds >= requiredLockup, Errors.InsufficientLockupFunds(payer, requiredLockup, availableFunds));
 
         // Check operator approval settings
@@ -93,7 +131,7 @@ library Rails {
             uint256 rateUsage,
             uint256 lockupUsage,
             uint256 maxLockupPeriod
-        ) = payments.operatorApprovals(usdfcTokenAddress, payer, address(this));
+        ) = payments.operatorApprovals(token, payer, address(this));
 
         // Verify operator is approved
         require(isApproved, Errors.OperatorNotApproved(payer, address(this)));
@@ -119,32 +157,48 @@ library Rails {
         );
     }
 
-    /// @notice Creates the data set's rails in its payment token and seeds its fee bookkeeping.
-    /// @dev Writes `info.lifecycleReserveBalance` (token units, mirrors the rail's lockupFixed) and
-    ///      `info.pendingOneTimePayments` (the create fee, in 18-decimal USD like every pending fee; converted
-    ///      to token units when flushed). The data set's currency was recorded by
-    ///      SignatureVerificationLib.verifyCreateDataSet. CDN is only available in the default token: FilBeam
-    ///      settles CDN rails in default-token amounts.
+    /// @notice Resolves the data set's payment currency, records its agreed price, and creates its rails.
+    /// @dev `token` and `storagePricePerTibPerMonth` are the signed terms returned by
+    ///      SignatureVerificationLib.verifyCreateDataSet. Token 0 or `defaultToken` is the default currency
+    ///      (id 0, no state written); any other token must be whitelisted, enabled and listed in the provider's
+    ///      `paymentTokens` registry capability. CDN is only available in the default token: FilBeam settles
+    ///      CDN rails in default-token amounts. Reads the payer, payee and provider id that FWSS has already
+    ///      written to the data set's record, and seeds `lifecycleReserveBalance` (token units, mirrors the PDP
+    ///      rail's lockupFixed) and `pendingOneTimePayments` (the create fee, in 18-decimal USD like every pending
+    ///      fee; converted to token units when paid).
+    /// @return pdpRailId The PDP rail
+    /// @return cacheMissRailId The cache-miss rail (0 without CDN)
+    /// @return cdnRailId The CDN rail (0 without CDN)
     function createRails(
         FilecoinPayV1 payments,
-        FilecoinWarmStorageService.DataSetInfo storage info,
         uint256 dataSetId,
-        IERC20 usdfcTokenAddress,
-        address payer,
-        address payee,
+        IERC20 token,
+        uint256 storagePricePerTibPerMonth,
+        IERC20 defaultToken,
+        ServiceProviderRegistry serviceProviderRegistry,
         address filBeamBeneficiaryAddress
     ) public returns (uint256 pdpRailId, uint256 cacheMissRailId, uint256 cdnRailId) {
+        DataSetInfoRecord storage info = dataSetInfo(dataSetId);
+        address payer = info.payer;
+        address payee = info.payee;
         bool hasCDN = filBeamBeneficiaryAddress != address(0);
-        if (hasCDN && PaymentTerms.pricing(dataSetId).currencyId != 0) {
-            revert Errors.CDNNotSupportedForCurrency(address(usdfcTokenAddress));
+        if (address(token) == address(0) || token == defaultToken) {
+            token = defaultToken;
+        } else {
+            require(!hasCDN, Errors.CDNNotSupportedForCurrency(address(token)));
+            PaymentTerms.pricing(dataSetId).currencyId =
+                uint8(PaymentTerms.resolveCurrency(address(token), info.providerId, serviceProviderRegistry));
+        }
+        if (storagePricePerTibPerMonth != 0) {
+            PaymentTerms.setPrice(dataSetId, storagePricePerTibPerMonth);
         }
         uint256 scale = PaymentTerms.scale(dataSetId);
         // Validate payer has sufficient funds and operator approvals to cover the required lockup
         // If CDN is enabled, validation must account for the additional fixed lockup amounts
-        validatePayerOperatorApprovalAndFunds(payments, usdfcTokenAddress, payer, hasCDN, scale);
+        validatePayerOperatorApprovalAndFunds(payments, token, payer, hasCDN, scale);
 
         pdpRailId = payments.createRail(
-            usdfcTokenAddress, // token address
+            token, // token address
             payer, // from (payer)
             payee, // payee address from registry
             address(this), // this contract acts as the validator
@@ -163,7 +217,7 @@ library Rails {
 
         if (hasCDN) {
             cacheMissRailId = payments.createRail(
-                usdfcTokenAddress, // token address
+                token, // token address
                 payer, // from (payer)
                 payee, // payee address from registry
                 address(0), // no validator
@@ -173,7 +227,7 @@ library Rails {
             payments.modifyRailLockup(cacheMissRailId, CDN_LOCKUP_PERIOD, DEFAULT_CACHE_MISS_LOCKUP_AMOUNT);
 
             cdnRailId = payments.createRail(
-                usdfcTokenAddress, // token address
+                token, // token address
                 payer, // from (payer)
                 filBeamBeneficiaryAddress, // to FilBeam beneficiary
                 address(0), // no validator
@@ -370,12 +424,11 @@ library Rails {
     }
 
     // ---------------------------------------------------------------------
-    // Currency whitelist administration (#618). FWSS forwards its owner-only
-    // `setCurrency(address,bool)` call here unchanged.
+    // Currency whitelist administration (#618), called by FWSS's `setCurrency`.
 
     /// @notice Whitelists `token` under the next id, or enables/disables an existing entry.
     /// @dev The default token (id 0) cannot be added. Decimals must be between 6 and 18.
-    function setCurrency(address token, bool enabled) public {
+    function setCurrency(address token, bool enabled, address defaultToken) public {
         // OwnableUpgradeable's ERC-7201 slot, read directly as upstream's FWSSOwnable does
         address owner;
         assembly ("memory-safe") {
@@ -385,10 +438,7 @@ library Rails {
         PaymentTermsStorage.FWSSCurrencyStorage storage $ = PaymentTerms.currencies();
         uint256 currencyId = $.ids[token];
         if (currencyId == 0) {
-            require(
-                token != address(FilecoinWarmStorageService(address(this)).usdfcTokenAddress()),
-                Errors.CurrencyAlreadyAdded(token)
-            );
+            require(token != defaultToken, Errors.CurrencyAlreadyAdded(token));
             uint8 decimals = IERC20Metadata(token).decimals();
             require(
                 decimals >= MIN_CURRENCY_DECIMALS && decimals <= PRICE_DECIMALS,
@@ -407,29 +457,22 @@ library Rails {
         emit CurrencyEnabledSet(uint8(currencyId), token, enabled);
     }
 
-    /// @notice Changes a data set's storage price by mutual consent and re-prices its rail.
-    /// @dev Body of FilecoinWarmStorageService.updateStoragePrice, kept here so the FWSS core carries only a
-    ///      forwarding stub. Runs by DELEGATECALL in the proxy: msg.sender is the original caller, `info` is
-    ///      the proxy's DataSetInfo, and immutables are read back through the proxy's public getters.
-    ///      The service provider submits; the payer (its session key, or the data set's authorizer) signs
-    ///      UpdateStoragePrice(dataSetId, nonce, storagePricePerTibPerMonth, deadline).
+    /// @notice Changes a data set's storage price by mutual consent and re-prices its rail (#619).
+    /// @dev Body of FilecoinWarmStorageService.updateStoragePrice. The service provider submits; the payer, or a
+    ///      payer session key holding the UpdateStoragePrice permission, signs
+    ///      UpdateStoragePrice(dataSetId, nonce, storagePricePerTibPerMonth, deadline). The data set's authorizer
+    ///      is not consulted. `deadline` is an epoch (block number), unlike session-key expiry (a timestamp).
     function updateStoragePrice(
-        FilecoinWarmStorageService.DataSetInfo storage info,
         uint256 dataSetId,
         uint256 storagePricePerTibPerMonth,
         uint256 nonce,
         uint256 deadline,
         bytes calldata signature,
-        bytes32 domainSeparator
+        bytes32 domainSeparator,
+        SessionKeyRegistry sessionKeyRegistry
     ) public {
-        // The data set's authorizer (#536), read from FWSS storage to keep the core stub small
-        address authorizer;
-        bytes32 authorizerRoot = DATA_SET_AUTHORIZER_ROOT_SLOT;
-        assembly ("memory-safe") {
-            mstore(0, dataSetId)
-            mstore(0x20, authorizerRoot)
-            authorizer := sload(keccak256(0, 0x40))
-        }
+        DataSetInfoRecord storage info = dataSetInfo(dataSetId);
+        address payer = info.payer;
         uint256 pdpRailId = info.pdpRailId;
         if (pdpRailId == 0) revert Errors.InvalidDataSetId(dataSetId);
         if (info.pdpEndEpoch != 0) revert Errors.DataSetPaymentAlreadyTerminated(dataSetId);
@@ -438,32 +481,46 @@ library Rails {
             revert Errors.CallerNotServiceProvider(dataSetId, serviceProvider, msg.sender);
         }
         if (block.number > deadline) revert Errors.StoragePriceUpdateExpired(dataSetId, deadline, block.number);
-
-        FilecoinWarmStorageService self = FilecoinWarmStorageService(address(this));
-        SignatureVerificationLib.verifyUpdateStoragePriceAuthorization(
-            info.payer,
+        SignatureVerificationLib.verifyUpdateStoragePriceSignature(
+            payer,
             dataSetId,
-            authorizer,
             nonce,
             storagePricePerTibPerMonth,
             deadline,
             signature,
             domainSeparator,
-            self.sessionKeyRegistry()
+            sessionKeyRegistry
         );
         PaymentTerms.updatePrice(dataSetId, storagePricePerTibPerMonth, nonce);
 
         // Re-price now so an idle data set picks up the new price; applies from the next epoch.
+        IFWSSConfig config = IFWSSConfig(address(this));
         info.lifecycleReserveBalance = updateStorageRates(
-            FilecoinPayV1(self.paymentsContractAddress()),
+            FilecoinPayV1(config.paymentsContractAddress()),
             dataSetId,
             pdpRailId,
-            IPDPVerifier(self.pdpVerifierAddress()).getDataSetLeafCount(dataSetId),
+            IPDPVerifier(config.pdpVerifierAddress()).getDataSetLeafCount(dataSetId),
             info.pendingOneTimePayments,
             info.lifecycleReserveBalance,
             0,
             false
         );
         info.pendingOneTimePayments = 0;
+    }
+
+    /// @notice Invalidates every outstanding UpdateStoragePrice signature for a data set by bumping its nonce.
+    /// @dev Callable by the payer or by a payer session key holding the UpdateStoragePrice permission.
+    function cancelStoragePriceOffers(uint256 dataSetId, SessionKeyRegistry sessionKeyRegistry) public {
+        address payer = dataSetInfo(dataSetId).payer;
+        if (payer == address(0)) revert Errors.InvalidDataSetId(dataSetId);
+        if (
+            msg.sender != payer
+                && sessionKeyRegistry.authorizationExpiry(
+                        payer, msg.sender, SignatureVerificationLib.UPDATE_STORAGE_PRICE_TYPEHASH
+                    ) < block.timestamp
+        ) {
+            revert Errors.CallerNotPayer(dataSetId, payer, msg.sender);
+        }
+        PaymentTerms.cancelOffers(dataSetId);
     }
 }

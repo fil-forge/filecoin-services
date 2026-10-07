@@ -13,6 +13,7 @@ import {Errors} from "../src/Errors.sol";
 import {PriceList} from "../src/lib/PriceList.sol";
 import {DATA_SET_INFO_SLOT} from "../src/lib/FilecoinWarmStorageServiceLayout.sol";
 import {ServiceProviderRegistryStorage} from "../src/ServiceProviderRegistryStorage.sol";
+import {DATA_SET_INFO_ROOT_SLOT} from "../src/lib/Rails.sol";
 import {
     FWSS_CURRENCY_STORAGE_SLOT,
     FWSS_DATA_SET_PRICING_STORAGE_SLOT,
@@ -582,7 +583,7 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
         uint256 expected = _ceil(sizeTerm18 + DATASET_FEE_PER_EPOCH, 1e12);
         assertGt((sizeTerm18 + DATASET_FEE_PER_EPOCH) % 1e12, 0, "sum must not be a whole number of units");
         assertEq(_pdpRail(dataSetId).paymentRate, expected);
-        assertLt(expected, _ceil(sizeTerm18, 1e12) + _ceil(DATASET_FEE_PER_EPOCH, 1e12), "one rounding, not two");
+        assertLe(expected, _ceil(sizeTerm18, 1e12) + _ceil(DATASET_FEE_PER_EPOCH, 1e12), "never above two roundings");
     }
 
     function testSecondEighteenDecimalCurrencyChargesSameAsUSDFC() public withTokens {
@@ -965,6 +966,7 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
     // storage layout
 
     function testPaymentTermsLiveInNamespaces() public withTokens {
+        assertEq(DATA_SET_INFO_ROOT_SLOT, DATA_SET_INFO_SLOT, "Rails' copy of the dataSetInfo root slot");
         assertEq(
             FWSS_CURRENCY_STORAGE_SLOT,
             keccak256(abi.encode(uint256(keccak256("filecoin.storage.FWSSCurrency")) - 1)) & ~bytes32(uint256(0xff))

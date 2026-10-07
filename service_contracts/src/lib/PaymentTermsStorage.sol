@@ -3,6 +3,8 @@ pragma solidity ^0.8.20;
 
 import {Errors} from "../Errors.sol";
 import {STORAGE_PRICE_PER_TIB_PER_MONTH, TOKEN_DECIMALS} from "./PriceListUSDFC.sol";
+import {ServiceProviderRegistry} from "../ServiceProviderRegistry.sol";
+import {ServiceProviderRegistryStorage} from "../ServiceProviderRegistryStorage.sol";
 
 /// @dev ERC-7201 location of {PaymentTermsStorage.FWSSCurrencyStorage}:
 ///      keccak256(abi.encode(uint256(keccak256("filecoin.storage.FWSSCurrency")) - 1)) & ~bytes32(uint256(0xff))
@@ -12,11 +14,6 @@ bytes32 constant FWSS_CURRENCY_STORAGE_SLOT = 0x2be83150facef7aa3ae5922e809766ad
 ///      keccak256(abi.encode(uint256(keccak256("filecoin.storage.FWSSDataSetPricing")) - 1)) & ~bytes32(uint256(0xff))
 bytes32 constant FWSS_DATA_SET_PRICING_STORAGE_SLOT =
     0x44ed9206e2d77446bd06f9698aeef56e4b0ec8004fef8f3eb108175dad5b9600;
-
-/// @dev Root slot of FWSS's `dataSetAuthorizer` mapping. Mirrors the generated
-///      `FilecoinWarmStorageServiceLayout.DATA_SET_AUTHORIZER_SLOT` (which Rails cannot import: the layout
-///      generator compiles FWSS, which links Rails). Pinned by AdjustableStoragePriceTest.
-bytes32 constant DATA_SET_AUTHORIZER_ROOT_SLOT = bytes32(uint256(23));
 
 /// @dev Prices and fees are 18-decimal USD (the price list). A token with `d` decimals is charged
 ///      ceil(amount / 10**(PRICE_DECIMALS - d)).
@@ -36,6 +33,11 @@ event CurrencyEnabledSet(uint8 indexed currencyId, address indexed token, bool e
 /// @param dataSetId The data set ID
 /// @param storagePricePerTibPerMonth Agreed price in 18-decimal USD; 0 means the posted price
 event DataSetStoragePriceSet(uint256 indexed dataSetId, uint256 storagePricePerTibPerMonth);
+
+/// @notice The payer invalidated every outstanding UpdateStoragePrice signature for a data set.
+/// @param dataSetId The data set ID
+/// @param nonce The data set's new price-update nonce; the next UpdateStoragePrice signature signs this value
+event StoragePriceOffersCancelled(uint256 indexed dataSetId, uint256 nonce);
 
 /// @title PaymentTermsStorage
 /// @notice Declares the namespaced state of the payment-currency (#618) and per-data-set price (#619) extensions.
@@ -114,6 +116,49 @@ library PaymentTerms {
         if (nonce != current) revert Errors.InvalidStoragePriceNonce(dataSetId, current, nonce);
         p.nonce = current + 1;
         _store(p, dataSetId, storagePricePerTibPerMonth);
+    }
+
+    /// @notice Invalidates every outstanding UpdateStoragePrice signature by consuming the current nonce.
+    function cancelOffers(uint256 dataSetId) internal {
+        PaymentTermsStorage.DataSetPricing storage p = pricing(dataSetId);
+        uint64 next = p.nonce + 1;
+        p.nonce = next;
+        emit StoragePriceOffersCancelled(dataSetId, next);
+    }
+
+    /// @notice Clears a deleted data set's payment terms.
+    function clear(uint256 dataSetId) internal {
+        PaymentTermsStorage.FWSSDataSetPricingStorage storage $;
+        assembly ("memory-safe") {
+            $.slot := FWSS_DATA_SET_PRICING_STORAGE_SLOT
+        }
+        delete $.dataSets[dataSetId];
+    }
+
+    /// @notice Whitelist id of an enabled, non-default token that the provider lists in its `paymentTokens`
+    ///         registry capability (20-byte addresses, packed).
+    function resolveCurrency(address token, uint256 providerId, ServiceProviderRegistry registry)
+        internal
+        view
+        returns (uint256 currencyId)
+    {
+        PaymentTermsStorage.FWSSCurrencyStorage storage $ = currencies();
+        currencyId = $.ids[token];
+        require(currencyId != 0 && $.currencies[currencyId].enabled, Errors.UnsupportedCurrency(token));
+
+        string[] memory capabilityKeys = new string[](1);
+        capabilityKeys[0] = PAYMENT_TOKENS_CAPABILITY_KEY;
+        bytes memory accepted = registry.getProductCapabilities(
+            providerId, ServiceProviderRegistryStorage.ProductType.PDP, capabilityKeys
+        )[0];
+        for (uint256 i = 0; i + 20 <= accepted.length; i += 20) {
+            address listed;
+            assembly ("memory-safe") {
+                listed := shr(96, mload(add(add(accepted, 0x20), i)))
+            }
+            if (listed == token) return currencyId;
+        }
+        revert Errors.CurrencyNotAcceptedByProvider(providerId, token);
     }
 
     function _store(PaymentTermsStorage.DataSetPricing storage p, uint256 dataSetId, uint256 price) private {

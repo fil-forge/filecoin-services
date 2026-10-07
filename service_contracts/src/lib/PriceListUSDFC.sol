@@ -69,9 +69,9 @@ function toTokenUnits(uint256 amount, uint256 scale) pure returns (uint256) {
 
 /**
  * @notice Calculate the storage rate per epoch at an agreed storage price, in a token's units (#618, #619)
- * @dev Each per-epoch term is computed at 18 decimals exactly as `calculateStorageRate` does and then converted
- *      to token units with ceiling division, so an 18-decimal token pays exactly the main formula and a
- *      6-decimal token pays at least one unit for each nonzero term.
+ * @dev The rate is computed at 18 decimals exactly as `calculateStorageRate` does (size term plus dataset fee) and
+ *      the sum is converted to token units once, rounding up. An 18-decimal token pays exactly the main formula;
+ *      a 6-decimal token pays at least one unit per epoch.
  * @param leafCount the count of the 32b leaves in the FRC-0069 tree
  * @param storagePricePerTibPerMonth Storage price in 18-decimal USD per TiB per month
  * @param scale 10 ** (18 - token decimals)
@@ -82,9 +82,8 @@ function calculateStorageRateAtPrice(uint256 leafCount, uint256 storagePricePerT
     returns (uint256 storageRatePerEpoch)
 {
     if (leafCount == 0) return 0;
-    uint256 sizeTerm =
-        (Cids.leafCountToRawSize(leafCount) * storagePricePerTibPerMonth) / (TIB_IN_BYTES * EPOCHS_PER_MONTH);
-    return toTokenUnits(sizeTerm, scale) + toTokenUnits(DATASET_FEE_PER_EPOCH, scale);
+    uint256 numerator = Cids.leafCountToRawSize(leafCount) * storagePricePerTibPerMonth;
+    return toTokenUnits(numerator / (TIB_IN_BYTES * EPOCHS_PER_MONTH) + DATASET_FEE_PER_EPOCH, scale);
 }
 
 /**

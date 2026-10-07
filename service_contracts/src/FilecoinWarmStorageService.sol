@@ -35,7 +35,7 @@ import {
     TOKEN_DECIMALS
 } from "./lib/PriceListUSDFC.sol";
 import {Rails} from "./lib/Rails.sol";
-import {PaymentTermsStorage} from "./lib/PaymentTermsStorage.sol";
+import {PaymentTerms, PaymentTermsStorage} from "./lib/PaymentTermsStorage.sol";
 import {SignatureVerificationLib} from "./lib/SignatureVerificationLib.sol";
 
 uint256 constant NO_PROVING_DEADLINE = 0;
@@ -544,23 +544,13 @@ contract FilecoinWarmStorageService is
 
     /**
      * @notice Adds a USD stablecoin to the payment-currency whitelist, or enables/disables it (#618)
-     * @dev Owner only. Implemented by `Rails.setCurrency(address,bool)`, which checks the owner;
-     *      the call is forwarded unchanged.
+     * @dev Owner only; `Rails.setCurrency` checks the owner.
      *      Disabling stops new data sets in the token; existing data sets keep paying in it.
      * @param token The stablecoin (6 to 18 decimals); amounts are the USD price list converted to it
      * @param enabled Whether new data sets may use it
      */
     function setCurrency(address token, bool enabled) external {
-        token;
-        enabled;
-        address rails = address(Rails);
-        assembly ("memory-safe") {
-            let ptr := mload(0x40)
-            calldatacopy(ptr, 0, calldatasize())
-            let ok := delegatecall(gas(), rails, ptr, calldatasize(), 0, 0)
-            returndatacopy(ptr, 0, returndatasize())
-            if iszero(ok) { revert(ptr, returndatasize()) }
-        }
+        Rails.setCurrency(token, enabled, address(usdfcTokenAddress));
     }
 
     // Listener interface methods
@@ -603,15 +593,8 @@ contract FilecoinWarmStorageService is
 
         // Verify the client's signature over any of the three extraData variants. The 0xc0 and 0xe0 variants
         // also select the payment token (#618); 0xe0 records the agreed storage price (#619).
-        address token = SignatureVerificationLib.verifyCreateDataSet(
-            extraData,
-            dataSetId,
-            payee,
-            providerId,
-            address(usdfcTokenAddress),
-            _domainSeparatorV4(),
-            sessionKeyRegistry
-        );
+        (address token, uint256 storagePricePerTibPerMonth) =
+            SignatureVerificationLib.verifyCreateDataSet(extraData, payee, _domainSeparatorV4(), sessionKeyRegistry);
 
         // Initialize the DataSetInfo struct
         DataSetInfo storage info = dataSetInfo[dataSetId];
@@ -662,7 +645,12 @@ contract FilecoinWarmStorageService is
         bool hasCDN = hasCDNMetadataKey(createData.metadataKeys);
 
         (uint256 pdpRailId, uint256 cacheMissRailId, uint256 cdnRailId) = payments.createRails(
-            info, dataSetId, IERC20(token), createData.payer, payee, hasCDN ? filBeamBeneficiaryAddress : address(0)
+            dataSetId,
+            IERC20(token),
+            storagePricePerTibPerMonth,
+            usdfcTokenAddress,
+            serviceProviderRegistry,
+            hasCDN ? filBeamBeneficiaryAddress : address(0)
         );
 
         railToDataSet[pdpRailId] = dataSetId;
@@ -776,6 +764,7 @@ contract FilecoinWarmStorageService is
         // Complete cleanup
         delete dataSetAuthorizer[dataSetId];
         delete dataSetInfo[dataSetId];
+        PaymentTerms.clear(dataSetId);
     }
 
     /**
@@ -1173,7 +1162,8 @@ contract FilecoinWarmStorageService is
 
     /**
      * @notice Changes a data set's storage price by mutual consent (#619)
-     * @dev The service provider submits; the payer (or its session key, or the data set's authorizer) signs
+     * @dev The service provider submits; the payer (or a payer session key with the UpdateStoragePrice
+     *      permission; the data set's authorizer is not consulted) signs
      *      UpdateStoragePrice(dataSetId, nonce, storagePricePerTibPerMonth, deadline). The rail is re-priced in the
      *      same call and the new rate applies from the next epoch. The effective price is max(agreed, posted).
      * @param dataSetId The data set ID
@@ -1190,14 +1180,17 @@ contract FilecoinWarmStorageService is
         bytes calldata signature
     ) external {
         Rails.updateStoragePrice(
-            dataSetInfo[dataSetId],
-            dataSetId,
-            storagePricePerTibPerMonth,
-            nonce,
-            deadline,
-            signature,
-            _domainSeparatorV4()
+            dataSetId, storagePricePerTibPerMonth, nonce, deadline, signature, _domainSeparatorV4(), sessionKeyRegistry
         );
+    }
+
+    /**
+     * @notice Invalidates every outstanding UpdateStoragePrice signature for a data set (#619)
+     * @dev Callable by the payer or by a payer session key holding the UpdateStoragePrice permission.
+     * @param dataSetId The data set ID
+     */
+    function cancelStoragePriceOffers(uint256 dataSetId) external {
+        Rails.cancelStoragePriceOffers(dataSetId, sessionKeyRegistry);
     }
 
     /**
