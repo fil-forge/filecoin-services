@@ -17,6 +17,7 @@ import {
 import {PriceList} from "./PriceList.sol";
 import {CURRENCY_REGISTRY_SLOT} from "./CurrencyRegistry.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "./FilecoinWarmStorageServiceLayout.sol" as StorageLayout;
 
 // bytes32(bytes4(keccak256(abi.encodePacked("extsloadStruct(bytes32,uint256)"))));
@@ -606,8 +607,7 @@ library FilecoinWarmStorageServiceStateInternalLibrary {
      *      that want the complete price picture.
      */
     function getPriceList(FilecoinWarmStorageService service) internal view returns (PriceList memory list) {
-        list = priceList();
-        list.token = IERC20(address(service.usdfcTokenAddress()));
+        return getPriceListForCurrency(service, address(service.usdfcTokenAddress()));
     }
 
     // ---------------------------------------------------------------------
@@ -639,7 +639,8 @@ library FilecoinWarmStorageServiceStateInternalLibrary {
         returns (address token, uint8 decimals, bool enabled)
     {
         if (currencyId == 0) {
-            return (address(service.usdfcTokenAddress()), 18, true);
+            IERC20Metadata defaultToken = service.usdfcTokenAddress();
+            return (address(defaultToken), defaultToken.decimals(), true);
         }
         uint256 word = uint256(service.extsload(keccak256(abi.encode(currencyId, uint256(CURRENCY_REGISTRY_SLOT) + 1))));
         token = address(uint160(word));

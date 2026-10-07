@@ -5,6 +5,7 @@ import {Errors} from "../Errors.sol";
 import {FilecoinPayV1} from "@fws-payments/FilecoinPayV1.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {
     CurrencyAdded,
     CurrencyEnabledSet,
@@ -345,9 +346,14 @@ library Rails {
         }
     }
 
-    /// @notice Currency code of an enabled non-default currency: id | (18 - decimals) << 8.
+    /// @notice Currency code of a requested token: id | (18 - decimals) << 8. The default token is id 0;
+    ///         any other token must be whitelisted and enabled.
     /// @dev The code is stored as `DataSetInfo.currency`.
     function resolveCurrency(address token) public view returns (uint16 code) {
+        // A variant request naming the default token is the default currency (id 0)
+        if (token == IDefaultCurrency(address(this)).usdfcTokenAddress()) {
+            return uint16(MAX_CURRENCY_DECIMALS - IERC20Metadata(token).decimals()) << 8;
+        }
         CurrencyRegistryStorage storage $ = CurrencyRegistry.layout();
         uint256 id = $.ids[token];
         Currency storage c = $.currencies[id];
@@ -362,6 +368,12 @@ library Rails {
     /// @notice Whitelists `token` under the next id, or enables/disables an existing entry.
     /// @dev The default token (id 0) cannot be added. Decimals must be between 6 and 18.
     function setCurrency(address token, bool enabled) public {
+        // OwnableUpgradeable's ERC-7201 slot, read directly as upstream's FWSSOwnable does
+        address owner;
+        assembly ("memory-safe") {
+            owner := sload(0x9016d09d72d40fdae2fd8ceac6b6234c7706214fd39c1cd1e609a0528c199300)
+        }
+        require(msg.sender == owner, OwnableUpgradeable.OwnableUnauthorizedAccount(msg.sender));
         CurrencyRegistryStorage storage $ = CurrencyRegistry.layout();
         uint256 currencyId = $.ids[token];
         if (currencyId == 0) {

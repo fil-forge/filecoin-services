@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 pragma solidity ^0.8.20;
 
-import {Errors} from "../Errors.sol";
-
 /// @dev ERC-7201 location of {CurrencyRegistryStorage}:
 ///      keccak256(abi.encode(uint256(keccak256("fwss.storage.currencies")) - 1)) & ~bytes32(uint256(0xff))
 bytes32 constant CURRENCY_REGISTRY_SLOT = 0xce14d13e508ebe613422ae6621b56280fb248a730a4c1776e0b3bd40cac71400;

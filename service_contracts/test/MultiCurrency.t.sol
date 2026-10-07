@@ -9,6 +9,8 @@ import {Cids} from "@pdp/Cids.sol";
 import {FilecoinPayV1} from "@fws-payments/FilecoinPayV1.sol";
 import {FilecoinWarmStorageServiceTest} from "./FilecoinWarmStorageService.t.sol";
 import {FilecoinWarmStorageService} from "../src/FilecoinWarmStorageService.sol";
+import {FilecoinWarmStorageServiceStateView} from "../src/FilecoinWarmStorageServiceStateView.sol";
+import {MyERC1967Proxy} from "@pdp/ERC1967Proxy.sol";
 import {Errors} from "../src/Errors.sol";
 import {PriceList} from "../src/lib/PriceList.sol";
 import {DATA_SET_INFO_SLOT} from "../src/lib/FilecoinWarmStorageServiceLayout.sol";
@@ -90,7 +92,7 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
             address who = i == 0 ? client : signingClient;
             axl.mint(who, 1_000_000e6);
             usd18.mint(who, 1_000_000e18);
-            mockUSDFC.transfer(who, 1000e18);
+            require(mockUSDFC.transfer(who, 1000e18));
         }
     }
 
@@ -528,6 +530,68 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
 
         vm.expectRevert(abi.encodeWithSelector(Errors.UnsupportedCurrency.selector, address(usd18)));
         viewContract.getPriceListForCurrency(address(usd18));
+    }
+
+    // ---------------------------------------------------------------------
+    // single-token deployment in a 6-decimal default token (the per-token-deployment path)
+
+    function _deployWithDefault(IERC20Metadata token) internal returns (FilecoinWarmStorageService svc) {
+        FilecoinWarmStorageService impl = new FilecoinWarmStorageService(
+            address(mockPDPVerifier),
+            address(payments),
+            token,
+            filBeamBeneficiary,
+            serviceProviderRegistry,
+            sessionKeyRegistry,
+            4
+        );
+        bytes memory init = abi.encodeWithSelector(
+            FilecoinWarmStorageService.initialize.selector, uint64(2880), uint256(60), filBeamController
+        );
+        svc = FilecoinWarmStorageService(address(new MyERC1967Proxy(address(impl), init)));
+    }
+
+    function testSixDecimalDefaultTokenDeployment() public withTokens {
+        FilecoinWarmStorageService svc = _deployWithDefault(axl);
+        FilecoinWarmStorageServiceStateView view6 = new FilecoinWarmStorageServiceStateView(svc);
+
+        vm.startPrank(client);
+        payments.setOperatorApproval(axl, address(svc), true, 1000e6, 1000e6, 365 days);
+        axl.approve(address(payments), 100e6);
+        payments.deposit(axl, client, 100e6);
+        vm.stopPrank();
+
+        makeSignaturePass(client);
+        vm.prank(serviceProvider);
+        uint256 dataSetId = mockPDPVerifier.createDataSet(svc, _extraDataV1(client, 51, FAKE_SIGNATURE));
+
+        FilecoinWarmStorageService.DataSetInfoView memory info = view6.getDataSet(dataSetId);
+        assertEq(address(payments.getRail(info.pdpRailId).token), address(axl));
+        assertEq(info.lifecycleReserveBalance, SIX_RESERVE);
+        assertEq(info.pendingOneTimePayments, SIX_CREATE_FEE);
+
+        (address token, uint8 decimals, bool enabled) = view6.getCurrency(0);
+        assertEq(token, address(axl));
+        assertEq(decimals, 6);
+        assertTrue(enabled);
+        PriceList memory list = view6.getPriceList();
+        assertEq(address(list.token), address(axl));
+        assertEq(list.rates.storagePerTibPerMonth, SIX_STORAGE_PER_TIB_MONTH);
+        assertEq(list.lockups.lifecycleReserveTarget, SIX_RESERVE);
+    }
+
+    function testDefaultTokenDecimalsOutOfRangeReverts() public withTokens {
+        MockStablecoin five = new MockStablecoin("FIVE", 5);
+        vm.expectRevert(abi.encodeWithSelector(Errors.InvalidCurrencyDecimals.selector, address(five), uint8(5)));
+        new FilecoinWarmStorageService(
+            address(mockPDPVerifier),
+            address(payments),
+            five,
+            filBeamBeneficiary,
+            serviceProviderRegistry,
+            sessionKeyRegistry,
+            4
+        );
     }
 
     // ---------------------------------------------------------------------

@@ -37,6 +37,7 @@ import {
     TOKEN_DECIMALS
 } from "./lib/PriceListUSDFC.sol";
 import {Rails} from "./lib/Rails.sol";
+import {MIN_CURRENCY_DECIMALS} from "./lib/CurrencyRegistry.sol";
 import {SignatureVerificationLib} from "./lib/SignatureVerificationLib.sol";
 
 uint256 constant NO_PROVING_DEADLINE = 0;
@@ -242,6 +243,9 @@ contract FilecoinWarmStorageService is
     // Upgrade sequence number, used by Initializable.reinitializer
     uint64 private immutable REINITIALIZER_VERSION;
 
+    // Currency code of usdfcTokenAddress: id 0, decimal shift (18 - decimals) in bits 8-15 (#618)
+    uint16 private immutable DEFAULT_CURRENCY_CODE;
+
     // External contract addresses
     address public immutable pdpVerifierAddress;
     address public immutable paymentsContractAddress;
@@ -385,7 +389,14 @@ contract FilecoinWarmStorageService is
         sessionKeyRegistry = _sessionKeyRegistry;
 
         // Verify token decimals from the USDFC token contract
-        require(TOKEN_DECIMALS == _usdfc.decimals());
+        // Any 6-18 decimal USD stablecoin can be the default token; amounts scale to its decimals.
+        // Proxies created before #618 hold 18-decimal USDFC data sets with a zero currency code.
+        uint8 decimals = _usdfc.decimals();
+        require(
+            decimals >= MIN_CURRENCY_DECIMALS && decimals <= TOKEN_DECIMALS,
+            Errors.InvalidCurrencyDecimals(address(_usdfc), decimals)
+        );
+        DEFAULT_CURRENCY_CODE = uint16(TOKEN_DECIMALS - decimals) << 8;
     }
 
     /**
@@ -546,12 +557,13 @@ contract FilecoinWarmStorageService is
 
     /**
      * @notice Adds a USD stablecoin to the payment-currency whitelist, or enables/disables it (#618)
-     * @dev Implemented by `Rails.setCurrency(address,bool)`; the call is forwarded unchanged.
+     * @dev Owner only. Implemented by `Rails.setCurrency(address,bool)`, which checks the owner;
+     *      the call is forwarded unchanged.
      *      Disabling stops new data sets in the token; existing data sets keep paying in it.
      * @param token The stablecoin (6 to 18 decimals); amounts are the USD price list scaled to it
      * @param enabled Whether new data sets may use it
      */
-    function setCurrency(address token, bool enabled) external onlyOwner {
+    function setCurrency(address token, bool enabled) external {
         token;
         enabled;
         address rails = address(Rails);
@@ -604,8 +616,8 @@ contract FilecoinWarmStorageService is
 
         // Verify the client's signature
         verifyCreateDataSetSignature(payee, createData, currency);
-        uint16 currencyCode;
-        if (currency != address(0) && currency != address(usdfcTokenAddress)) {
+        uint16 currencyCode = DEFAULT_CURRENCY_CODE;
+        if (currency != address(0)) {
             currencyCode = Rails.resolveCurrency(currency);
         }
 
@@ -660,7 +672,7 @@ contract FilecoinWarmStorageService is
 
         (uint256 pdpRailId, uint256 cacheMissRailId, uint256 cdnRailId) = payments.createRails(
             dataSetId,
-            currencyCode == 0 ? usdfcTokenAddress : IERC20(currency),
+            currency == address(0) ? usdfcTokenAddress : IERC20(currency),
             createData.payer,
             payee,
             hasCDN ? filBeamBeneficiaryAddress : address(0)
@@ -1384,7 +1396,7 @@ contract FilecoinWarmStorageService is
         // abi.decode above has checked the head is in bounds. The signature commits to the currency.
         assembly ("memory-safe") {
             if iszero(eq(calldataload(add(extraData.offset, 0x40)), 0xa0)) {
-                currency := and(calldataload(add(extraData.offset, 0xa0)), 0xffffffffffffffffffffffffffffffffffffffff)
+                currency := shr(96, shl(96, calldataload(add(extraData.offset, 0xa0))))
             }
         }
 
