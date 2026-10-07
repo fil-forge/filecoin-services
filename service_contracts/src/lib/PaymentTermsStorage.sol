@@ -27,7 +27,13 @@ string constant PAYMENT_TOKENS_CAPABILITY_KEY = "paymentTokens";
 
 event CurrencyAdded(uint8 indexed currencyId, address indexed token, uint8 decimals);
 
-event CurrencyEnabledSet(uint8 indexed currencyId, address indexed token, bool enabled);
+/// @notice A whitelist entry was configured
+/// @param commissionBps Commission on the PDP rails of data sets created from now on in this currency, paid to
+///        FilecoinPay's own account and burned through its fee auction
+event CurrencyUpdated(uint8 indexed currencyId, address indexed token, bool enabled, uint16 commissionBps);
+
+/// @dev FilecoinPay's COMMISSION_MAX_BPS; createRail rejects anything above it.
+uint256 constant MAX_COMMISSION_BPS = 10_000;
 
 /// @notice The client-agreed storage price of a data set was set at creation or changed by mutual consent.
 /// @param dataSetId The data set ID
@@ -50,6 +56,9 @@ abstract contract PaymentTermsStorage {
         address token;
         uint8 decimals;
         bool enabled; // false: no new data sets; existing data sets keep paying in it
+        // Commission on the PDP rail of each new data set in this currency, paid to FilecoinPay's own account
+        // (burned through its fee auction). Fixed per rail at creation.
+        uint16 commissionBps;
     }
 
     /// @custom:storage-location erc7201:filecoin.storage.FWSSCurrency

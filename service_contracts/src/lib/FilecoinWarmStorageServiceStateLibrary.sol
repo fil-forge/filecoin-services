@@ -647,20 +647,22 @@ library FilecoinWarmStorageServiceStateLibrary {
      * @return token The stablecoin (id 0: `usdfcTokenAddress`)
      * @return decimals Its decimals; FWSS charges the USD price list converted to them, rounding up
      * @return enabled Whether new data sets may pay in it
+     * @return commissionBps Commission on PDP rails of new data sets in it, burned through FilecoinPay
      */
     function getCurrency(FilecoinWarmStorageService service, uint256 currencyId)
         public
         view
-        returns (address token, uint8 decimals, bool enabled)
+        returns (address token, uint8 decimals, bool enabled, uint16 commissionBps)
     {
         if (currencyId == 0) {
-            return (address(service.usdfcTokenAddress()), uint8(TOKEN_DECIMALS), true);
+            return (address(service.usdfcTokenAddress()), uint8(TOKEN_DECIMALS), true, uint16(SERVICE_COMMISSION_BPS));
         }
         uint256 word =
             uint256(service.extsload(keccak256(abi.encode(currencyId, uint256(FWSS_CURRENCY_STORAGE_SLOT) + 1))));
         token = address(uint160(word));
         decimals = uint8(word >> 160);
         enabled = uint8(word >> 168) != 0;
+        commissionBps = uint16(word >> 176);
     }
 
     /**
@@ -671,7 +673,7 @@ library FilecoinWarmStorageServiceStateLibrary {
         view
         returns (address token, uint8 decimals)
     {
-        (token, decimals,) = getCurrency(service, _dataSetCurrencyId(service, dataSetId));
+        (token, decimals,,) = getCurrency(service, _dataSetCurrencyId(service, dataSetId));
     }
 
     /**
@@ -691,7 +693,7 @@ library FilecoinWarmStorageServiceStateLibrary {
         list = getPriceList(service);
         if (address(list.token) == token) return list;
         uint256 currencyId = getCurrencyId(service, token);
-        (address currencyToken, uint8 decimals,) = getCurrency(service, currencyId);
+        (address currencyToken, uint8 decimals,,) = getCurrency(service, currencyId);
         require(currencyId != 0 && currencyToken == token, Errors.UnsupportedCurrency(token));
         uint256 scale = 10 ** (PRICE_DECIMALS - decimals);
         list.token = IERC20(token);

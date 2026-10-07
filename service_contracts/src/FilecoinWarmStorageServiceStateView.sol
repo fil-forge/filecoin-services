@@ -75,7 +75,11 @@ contract FilecoinWarmStorageServiceStateView is IPDPProvingSchedule {
         return service.getClientDataSetsLength(payer);
     }
 
-    function getCurrency(uint256 currencyId) external view returns (address token, uint8 decimals, bool enabled) {
+    function getCurrency(uint256 currencyId)
+        external
+        view
+        returns (address token, uint8 decimals, bool enabled, uint16 commissionBps)
+    {
         return service.getCurrency(currencyId);
     }
 

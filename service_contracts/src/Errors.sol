@@ -412,4 +412,8 @@ library Errors {
     /// @notice The create-data-set extraData is in none of the supported variants
     /// @param keysOffset ABI offset of the `keys` field (0xa0 legacy, 0xc0 with currency, 0xe0 with payment terms)
     error UnsupportedExtraDataVariant(uint256 keysOffset);
+
+    /// @notice A currency commission above FilecoinPay's maximum of 10,000 basis points
+    /// @param commissionBps The rejected commission
+    error InvalidCommissionBps(uint256 commissionBps);
 }

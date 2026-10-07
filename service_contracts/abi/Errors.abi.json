@@ -520,6 +520,17 @@
   },
   {
     "type": "error",
+    "name": "InvalidCommissionBps",
+    "inputs": [
+      {
+        "name": "commissionBps",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "InvalidCurrencyDecimals",
     "inputs": [
       {

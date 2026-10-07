@@ -12,7 +12,8 @@ import {ServiceProviderRegistry} from "../ServiceProviderRegistry.sol";
 import {SignatureVerificationLib} from "./SignatureVerificationLib.sol";
 import {
     CurrencyAdded,
-    CurrencyEnabledSet,
+    CurrencyUpdated,
+    MAX_COMMISSION_BPS,
     MIN_CURRENCY_DECIMALS,
     PRICE_DECIMALS,
     PaymentTerms,
@@ -182,12 +183,19 @@ library Rails {
         address payer = info.payer;
         address payee = info.payee;
         bool hasCDN = filBeamBeneficiaryAddress != address(0);
+        // Main's PDP rail terms for the default currency; a non-default currency's commission is paid to
+        // FilecoinPay's own account, which only its burnForFees auction can empty.
+        uint256 commissionBps = SERVICE_COMMISSION_BPS;
+        address serviceFeeRecipient = address(this);
         if (address(token) == address(0) || token == defaultToken) {
             token = defaultToken;
         } else {
             require(!hasCDN, Errors.CDNNotSupportedForCurrency(address(token)));
-            PaymentTerms.pricing(dataSetId).currencyId =
-                uint8(PaymentTerms.resolveCurrency(address(token), info.providerId, serviceProviderRegistry));
+            uint256 currencyId = PaymentTerms.resolveCurrency(address(token), info.providerId, serviceProviderRegistry);
+            PaymentTerms.pricing(dataSetId).currencyId = uint8(currencyId);
+            commissionBps = PaymentTerms.currencies().currencies[currencyId].commissionBps;
+            serviceFeeRecipient = address(payments);
+            info.commissionBps = commissionBps; // recorded per data set, as the rail fixes it
         }
         if (storagePricePerTibPerMonth != 0) {
             PaymentTerms.setPrice(dataSetId, storagePricePerTibPerMonth);
@@ -202,8 +210,8 @@ library Rails {
             payer, // from (payer)
             payee, // payee address from registry
             address(this), // this contract acts as the validator
-            SERVICE_COMMISSION_BPS, // commission rate based on CDN usage
-            address(this)
+            commissionBps, // 0 for the default currency; the currency's commission otherwise
+            serviceFeeRecipient
         );
 
         // Set lockup period and seed the lifecycle reserve
@@ -428,13 +436,14 @@ library Rails {
 
     /// @notice Whitelists `token` under the next id, or enables/disables an existing entry.
     /// @dev The default token (id 0) cannot be added. Decimals must be between 6 and 18.
-    function setCurrency(address token, bool enabled, address defaultToken) public {
+    function setCurrency(address token, bool enabled, uint16 commissionBps, address defaultToken) public {
         // OwnableUpgradeable's ERC-7201 slot, read directly as upstream's FWSSOwnable does
         address owner;
         assembly ("memory-safe") {
             owner := sload(0x9016d09d72d40fdae2fd8ceac6b6234c7706214fd39c1cd1e609a0528c199300)
         }
         require(msg.sender == owner, OwnableUpgradeable.OwnableUnauthorizedAccount(msg.sender));
+        require(commissionBps <= MAX_COMMISSION_BPS, Errors.InvalidCommissionBps(commissionBps));
         PaymentTermsStorage.FWSSCurrencyStorage storage $ = PaymentTerms.currencies();
         uint256 currencyId = $.ids[token];
         if (currencyId == 0) {
@@ -448,13 +457,16 @@ library Rails {
             require(currencyId <= type(uint8).max, Errors.TooManyCurrencies());
             $.count = currencyId;
             $.ids[token] = currencyId;
-            $.currencies[currencyId] =
-                PaymentTermsStorage.Currency({token: token, decimals: decimals, enabled: enabled});
+            $.currencies[currencyId] = PaymentTermsStorage.Currency({
+                token: token, decimals: decimals, enabled: enabled, commissionBps: commissionBps
+            });
             emit CurrencyAdded(uint8(currencyId), token, decimals);
         } else {
-            $.currencies[currencyId].enabled = enabled;
+            PaymentTermsStorage.Currency storage c = $.currencies[currencyId];
+            c.enabled = enabled;
+            c.commissionBps = commissionBps;
         }
-        emit CurrencyEnabledSet(uint8(currencyId), token, enabled);
+        emit CurrencyUpdated(uint8(currencyId), token, enabled, commissionBps);
     }
 
     /// @notice Changes a data set's storage price by mutual consent and re-prices its rail (#619).

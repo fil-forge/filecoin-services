@@ -382,6 +382,11 @@
         "name": "enabled",
         "type": "bool",
         "internalType": "bool"
+      },
+      {
+        "name": "commissionBps",
+        "type": "uint16",
+        "internalType": "uint16"
       }
     ],
     "stateMutability": "view"

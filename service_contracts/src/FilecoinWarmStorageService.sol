@@ -548,9 +548,11 @@ contract FilecoinWarmStorageService is
      *      Disabling stops new data sets in the token; existing data sets keep paying in it.
      * @param token The stablecoin (6 to 18 decimals); amounts are the USD price list converted to it
      * @param enabled Whether new data sets may use it
+     * @param commissionBps Commission on the PDP rails of data sets created from now on in this token, paid to
+     *        FilecoinPay's own account and burned through its fee auction (at most 10,000)
      */
-    function setCurrency(address token, bool enabled) external {
-        Rails.setCurrency(token, enabled, address(usdfcTokenAddress));
+    function setCurrency(address token, bool enabled, uint16 commissionBps) external {
+        Rails.setCurrency(token, enabled, commissionBps, address(usdfcTokenAddress));
     }
 
     // Listener interface methods

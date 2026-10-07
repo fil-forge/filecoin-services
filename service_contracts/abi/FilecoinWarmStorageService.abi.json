@@ -688,6 +688,11 @@
         "name": "enabled",
         "type": "bool",
         "internalType": "bool"
+      },
+      {
+        "name": "commissionBps",
+        "type": "uint16",
+        "internalType": "uint16"
       }
     ],
     "outputs": [],
@@ -2304,7 +2309,7 @@
   },
   {
     "type": "event",
-    "name": "CurrencyEnabledSet",
+    "name": "CurrencyUpdated",
     "inputs": [
       {
         "name": "currencyId",
@@ -2323,6 +2328,12 @@
         "type": "bool",
         "indexed": false,
         "internalType": "bool"
+      },
+      {
+        "name": "commissionBps",
+        "type": "uint16",
+        "indexed": false,
+        "internalType": "uint16"
       }
     ],
     "anonymous": false
