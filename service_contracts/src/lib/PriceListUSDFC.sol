@@ -68,6 +68,19 @@ function calculateStorageRate(uint256 leafCount) pure returns (uint256 storageRa
 }
 
 /**
+ * @notice Storage rate per epoch in a currency whose amounts are `amount18 / scale`
+ * @dev Each term is truncated separately, so a 6-decimal currency is charged exactly what a
+ *      price list written at 6 decimals would charge (size term plus one unit of dataset fee).
+ * @param leafCount the count of the 32b leaves in the FRC-0069 tree
+ * @param scale 10 ** (18 - token decimals)
+ */
+function calculateStorageRate(uint256 leafCount, uint256 scale) pure returns (uint256 storageRatePerEpoch) {
+    if (leafCount == 0) return 0;
+    return (Cids.leafCountToRawSize(leafCount) * STORAGE_PRICE_PER_TIB_PER_MONTH)
+        / (TIB_IN_BYTES * EPOCHS_PER_MONTH * scale) + DATASET_FEE_PER_EPOCH / scale;
+}
+
+/**
  * @notice Assemble the full PriceList from the USDFC constants.
  * @dev `token` returns as the zero address; the caller populates it with the deployment's
  *      USDFC instance address (FWSS holds it as an immutable).

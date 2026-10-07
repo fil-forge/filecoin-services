@@ -21,6 +21,13 @@ library SignatureVerificationLib {
         "CreateDataSet(uint256 clientDataSetId,address payee,MetadataEntry[] metadata)MetadataEntry(string key,string value)"
     );
 
+    /// @dev #618: the payer signs the payment currency. Session keys authorize it under the
+    ///      CREATE_DATA_SET_TYPEHASH permission; FilecoinPay operator approvals are per token.
+    bytes32 internal constant CREATE_DATA_SET_WITH_CURRENCY_TYPEHASH = keccak256(
+        "CreateDataSetWithCurrency(uint256 clientDataSetId,address payee,address currency,MetadataEntry[] metadata)"
+        "MetadataEntry(string key,string value)"
+    );
+
     bytes32 internal constant CID_TYPEHASH = keccak256("Cid(bytes data)");
 
     bytes32 internal constant PIECE_METADATA_TYPEHASH =
@@ -75,6 +82,24 @@ library SignatureVerificationLib {
     ) public pure returns (bytes32 structHash) {
         return keccak256(
             abi.encode(CREATE_DATA_SET_TYPEHASH, clientDataSetId, payee, hashMetadataEntries(keys, values))
+        );
+    }
+
+    /// @notice Struct hash for either CreateDataSet variant.
+    /// @param currency address(0) for the legacy CreateDataSet message, else the payment token
+    function createDataSetStructHashWithCurrency(
+        uint256 clientDataSetId,
+        address payee,
+        address currency,
+        string[] calldata keys,
+        string[] calldata values
+    ) public pure returns (bytes32 structHash) {
+        bytes32 metadataHash = hashMetadataEntries(keys, values);
+        if (currency == address(0)) {
+            return keccak256(abi.encode(CREATE_DATA_SET_TYPEHASH, clientDataSetId, payee, metadataHash));
+        }
+        return keccak256(
+            abi.encode(CREATE_DATA_SET_WITH_CURRENCY_TYPEHASH, clientDataSetId, payee, currency, metadataHash)
         );
     }
 

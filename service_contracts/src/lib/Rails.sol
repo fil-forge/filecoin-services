@@ -4,6 +4,16 @@ pragma solidity ^0.8.20;
 import {Errors} from "../Errors.sol";
 import {FilecoinPayV1} from "@fws-payments/FilecoinPayV1.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {
+    CurrencyAdded,
+    CurrencyEnabledSet,
+    CurrencyRegistry,
+    CurrencyRegistryStorage,
+    Currency,
+    MAX_CURRENCY_DECIMALS,
+    MIN_CURRENCY_DECIMALS
+} from "./CurrencyRegistry.sol";
 import {
     CDN_LOCKUP_PERIOD,
     DATASET_FEE_PER_EPOCH,
@@ -15,7 +25,8 @@ import {
     LIFECYCLE_RESERVE_TARGET,
     REPLENISH_THRESHOLD,
     SERVICE_COMMISSION_BPS,
-    calculateStorageRate
+    calculateStorageRate,
+    TOKEN_DECIMALS
 } from "./PriceListUSDFC.sol";
 
 event CDNPaymentRailsToppedUp(
@@ -43,11 +54,13 @@ library Rails {
     /// @param usdfcTokenAddress The USDFC token used for deposits and operator approvals
     /// @param payer The address of the payer
     /// @param includeCDN Whether to include fixed CDN/cache-miss lockups in the requirement checks
+    /// @param scale Divisor from the 18-decimal price list to the token's units
     function validatePayerOperatorApprovalAndFunds(
         FilecoinPayV1 payments,
         IERC20 usdfcTokenAddress,
         address payer,
-        bool includeCDN
+        bool includeCDN,
+        uint256 scale
     ) internal view {
         // Required capacity: lifecycle reserve plus per-dataset fee lockup at the default period.
         // Multiply-first preserves the exact monthly value for cleaner error messages; slightly
@@ -60,6 +73,9 @@ library Rails {
         if (includeCDN) {
             requiredLockup += DEFAULT_CACHE_MISS_LOCKUP_AMOUNT + DEFAULT_CDN_LOCKUP_AMOUNT;
         }
+        // Every term is a whole number of 10**12 units, so dividing the sum is exact
+        requiredLockup /= scale;
+        uint256 datasetFeePerEpoch = DATASET_FEE_PER_EPOCH / scale;
 
         // Check that payer has sufficient available funds
         (,, uint256 availableFunds,) = payments.getAccountInfoIfSettled(usdfcTokenAddress, payer);
@@ -82,8 +98,8 @@ library Rails {
         // dataset's rate (size-proportional component sits on top). Empty datasets never consume
         // it; required up front for the dataset to be eligible to receive pieces.
         require(
-            rateAllowance >= rateUsage + DATASET_FEE_PER_EPOCH,
-            Errors.InsufficientRateAllowance(payer, address(this), rateAllowance, rateUsage, DATASET_FEE_PER_EPOCH)
+            rateAllowance >= rateUsage + datasetFeePerEpoch,
+            Errors.InsufficientRateAllowance(payer, address(this), rateAllowance, rateUsage, datasetFeePerEpoch)
         );
 
         // Verify lockup allowance is sufficient
@@ -105,12 +121,13 @@ library Rails {
         IERC20 usdfcTokenAddress,
         address payer,
         address payee,
-        address filBeamBeneficiaryAddress
+        address filBeamBeneficiaryAddress,
+        uint256 scale
     ) public returns (uint256 pdpRailId, uint256 cacheMissRailId, uint256 cdnRailId) {
         bool hasCDN = filBeamBeneficiaryAddress != address(0);
         // Validate payer has sufficient funds and operator approvals to cover the required lockup
         // If CDN is enabled, validation must account for the additional fixed lockup amounts
-        validatePayerOperatorApprovalAndFunds(payments, usdfcTokenAddress, payer, hasCDN);
+        validatePayerOperatorApprovalAndFunds(payments, usdfcTokenAddress, payer, hasCDN, scale);
 
         pdpRailId = payments.createRail(
             usdfcTokenAddress, // token address
@@ -122,7 +139,7 @@ library Rails {
         );
 
         // Set lockup period and seed the lifecycle reserve
-        payments.modifyRailLockup(pdpRailId, DEFAULT_LOCKUP_PERIOD, LIFECYCLE_RESERVE_TARGET);
+        payments.modifyRailLockup(pdpRailId, DEFAULT_LOCKUP_PERIOD, LIFECYCLE_RESERVE_TARGET / scale);
 
         cacheMissRailId = 0;
         cdnRailId = 0;
@@ -136,7 +153,8 @@ library Rails {
                 0, // no service commission
                 address(this) // controller
             );
-            payments.modifyRailLockup(cacheMissRailId, CDN_LOCKUP_PERIOD, DEFAULT_CACHE_MISS_LOCKUP_AMOUNT);
+            uint256 cacheMissLockup = DEFAULT_CACHE_MISS_LOCKUP_AMOUNT / scale;
+            payments.modifyRailLockup(cacheMissRailId, CDN_LOCKUP_PERIOD, cacheMissLockup);
 
             cdnRailId = payments.createRail(
                 usdfcTokenAddress, // token address
@@ -146,15 +164,10 @@ library Rails {
                 0, // no service commission
                 address(this) // controller
             );
-            payments.modifyRailLockup(cdnRailId, CDN_LOCKUP_PERIOD, DEFAULT_CDN_LOCKUP_AMOUNT);
+            uint256 cdnLockup = DEFAULT_CDN_LOCKUP_AMOUNT / scale;
+            payments.modifyRailLockup(cdnRailId, CDN_LOCKUP_PERIOD, cdnLockup);
 
-            emit CDNPaymentRailsToppedUp(
-                dataSetId,
-                DEFAULT_CDN_LOCKUP_AMOUNT,
-                DEFAULT_CDN_LOCKUP_AMOUNT,
-                DEFAULT_CACHE_MISS_LOCKUP_AMOUNT,
-                DEFAULT_CACHE_MISS_LOCKUP_AMOUNT
-            );
+            emit CDNPaymentRailsToppedUp(dataSetId, cdnLockup, cdnLockup, cacheMissLockup, cacheMissLockup);
         }
     }
 
@@ -276,10 +289,11 @@ library Rails {
         uint256 pdpRailId,
         uint256 pdpEndEpoch,
         uint96 reserveBalance,
-        uint96 pending
+        uint96 pending,
+        uint256 scale
     ) internal returns (uint96) {
-        if (pdpEndEpoch == 0 && reserveBalance < pending + uint96(REPLENISH_THRESHOLD)) {
-            uint96 newLockup = uint96(LIFECYCLE_RESERVE_TARGET) + pending;
+        if (pdpEndEpoch == 0 && reserveBalance < pending + uint96(REPLENISH_THRESHOLD / scale)) {
+            uint96 newLockup = uint96(LIFECYCLE_RESERVE_TARGET / scale) + pending;
             payments.modifyRailLockup(pdpRailId, DEFAULT_LOCKUP_PERIOD, newLockup);
             return newLockup;
         }
@@ -294,15 +308,17 @@ library Rails {
         uint96 pending,
         uint96 reserveBalance,
         uint256 pdpEndEpoch,
-        bool immediateTermination
+        bool immediateTermination,
+        uint256 scale
     ) public returns (uint96 newReserveBalance) {
-        uint256 newStorageRatePerEpoch = calculateStorageRate(leafCount);
+        uint256 newStorageRatePerEpoch = calculateStorageRate(leafCount, scale);
         if (immediateTermination) {
             // No try/catch: immediateTermination implies the payer consented and is solvent.
             payments.modifyRailLockup(pdpRailId, 0, pending);
             newReserveBalance = 0;
         } else {
-            uint96 replenished = replenishReserveIfNeeded(payments, pdpRailId, pdpEndEpoch, reserveBalance, pending);
+            uint96 replenished =
+                replenishReserveIfNeeded(payments, pdpRailId, pdpEndEpoch, reserveBalance, pending, scale);
             if (replenished < pending) {
                 pending = replenished;
             }
@@ -310,5 +326,43 @@ library Rails {
         }
         payments.modifyRailPayment(pdpRailId, newStorageRatePerEpoch, pending);
         emit RailRateUpdated(dataSetId, pdpRailId, newStorageRatePerEpoch);
+    }
+
+    // ---------------------------------------------------------------------
+    // Currency whitelist administration (#618). Called by FWSS behind onlyOwner.
+
+    /// @notice Whitelists a USD stablecoin under the next id.
+    /// @param token The stablecoin; its decimals must be between 6 and 18
+    /// @param defaultToken The deployment's default token (id 0), which cannot be added again
+    function addCurrency(IERC20Metadata token, address defaultToken) public returns (uint8 currencyId) {
+        CurrencyRegistryStorage storage $ = CurrencyRegistry.layout();
+        require(address(token) != defaultToken && $.ids[address(token)] == 0, Errors.CurrencyAlreadyAdded(address(token)));
+        uint8 decimals = token.decimals();
+        require(
+            decimals >= MIN_CURRENCY_DECIMALS && decimals <= MAX_CURRENCY_DECIMALS,
+            Errors.InvalidCurrencyDecimals(address(token), decimals)
+        );
+        uint256 next = $.count + 1;
+        require(next <= type(uint8).max, Errors.TooManyCurrencies());
+        currencyId = uint8(next);
+        $.count = next;
+        $.ids[address(token)] = next;
+        $.currencies[next] = Currency({
+            token: address(token),
+            scale: uint64(10 ** (TOKEN_DECIMALS - decimals)),
+            decimals: decimals,
+            enabled: true
+        });
+        emit CurrencyAdded(currencyId, address(token), decimals);
+    }
+
+    /// @notice Enables or disables new data sets in a whitelisted currency.
+    /// @dev Existing data sets keep paying in their currency either way.
+    function setCurrencyEnabled(address token, bool enabled) public {
+        CurrencyRegistryStorage storage $ = CurrencyRegistry.layout();
+        uint256 currencyId = $.ids[token];
+        require(currencyId != 0, Errors.UnsupportedCurrency(token));
+        $.currencies[currencyId].enabled = enabled;
+        emit CurrencyEnabledSet(uint8(currencyId), token, enabled);
     }
 }

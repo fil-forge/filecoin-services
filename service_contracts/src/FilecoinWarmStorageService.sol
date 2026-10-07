@@ -37,6 +37,7 @@ import {
     TOKEN_DECIMALS
 } from "./lib/PriceListUSDFC.sol";
 import {Rails} from "./lib/Rails.sol";
+import {CurrencyRegistry} from "./lib/CurrencyRegistry.sol";
 import {SignatureVerificationLib} from "./lib/SignatureVerificationLib.sol";
 
 uint256 constant NO_PROVING_DEADLINE = 0;
@@ -159,6 +160,7 @@ contract FilecoinWarmStorageService is
         uint256 providerId; // Provider ID from the ServiceProviderRegistry
         uint96 pendingOneTimePayments; // fees accumulated since last flush via updateStorageRates
         uint96 lifecycleReserveBalance; // local mirror of rail's lockupFixed; decremented on flush
+        uint8 currencyId; // payment currency: 0 = usdfcTokenAddress, else CurrencyRegistry id (#618)
     }
 
     // Storage for data set payment information with dataSetId
@@ -541,6 +543,24 @@ contract FilecoinWarmStorageService is
         emit ProviderUnapproved(providerId);
     }
 
+    /**
+     * @notice Whitelists a USD stablecoin that new data sets may pay in (#618)
+     * @dev Amounts are the USD price list scaled to the token's decimals (6 to 18).
+     * @param token The stablecoin
+     */
+    function addCurrency(IERC20Metadata token) external onlyOwner {
+        Rails.addCurrency(token, address(usdfcTokenAddress));
+    }
+
+    /**
+     * @notice Enables or disables new data sets in a whitelisted currency
+     * @param token The stablecoin
+     * @param enabled Whether new data sets may use it
+     */
+    function setCurrencyEnabled(address token, bool enabled) external onlyOwner {
+        Rails.setCurrencyEnabled(token, enabled);
+    }
+
     // Listener interface methods
     /**
      * @notice Handles data set creation by creating a payment rail
@@ -560,7 +580,7 @@ contract FilecoinWarmStorageService is
             len <= MAX_CREATE_DATA_SET_EXTRA_DATA_SIZE,
             Errors.ExtraDataTooLarge(len, MAX_CREATE_DATA_SET_EXTRA_DATA_SIZE)
         );
-        DataSetCreateData memory createData = decodeDataSetCreateData(extraData);
+        (DataSetCreateData memory createData, address currency) = decodeDataSetCreateData(extraData);
 
         // Validate the addresses
         require(createData.payer != address(0), Errors.ZeroAddress(Errors.AddressField.Payer));
@@ -580,7 +600,8 @@ contract FilecoinWarmStorageService is
         clientDataSets[createData.payer].push(dataSetId);
 
         // Verify the client's signature
-        verifyCreateDataSetSignature(payee, createData);
+        verifyCreateDataSetSignature(payee, createData, currency);
+        (uint8 currencyId, uint256 scale) = CurrencyRegistry.resolve(currency, address(usdfcTokenAddress));
 
         // Initialize the DataSetInfo struct
         DataSetInfo storage info = dataSetInfo[dataSetId];
@@ -631,13 +652,19 @@ contract FilecoinWarmStorageService is
         bool hasCDN = hasCDNMetadataKey(createData.metadataKeys);
 
         (uint256 pdpRailId, uint256 cacheMissRailId, uint256 cdnRailId) = payments.createRails(
-            dataSetId, usdfcTokenAddress, createData.payer, payee, hasCDN ? filBeamBeneficiaryAddress : address(0)
+            dataSetId,
+            currencyId == 0 ? usdfcTokenAddress : IERC20(currency),
+            createData.payer,
+            payee,
+            hasCDN ? filBeamBeneficiaryAddress : address(0),
+            scale
         );
 
         railToDataSet[pdpRailId] = dataSetId;
         info.pdpRailId = pdpRailId;
-        info.lifecycleReserveBalance = uint96(LIFECYCLE_RESERVE_TARGET);
-        info.pendingOneTimePayments = uint96(CREATE_DATA_SET_FEE);
+        info.lifecycleReserveBalance = uint96(LIFECYCLE_RESERVE_TARGET / scale);
+        info.pendingOneTimePayments = uint96(CREATE_DATA_SET_FEE / scale);
+        info.currencyId = currencyId;
         if (hasCDN) {
             info.cacheMissRailId = cacheMissRailId;
             info.cdnRailId = cdnRailId;
@@ -820,8 +847,11 @@ contract FilecoinWarmStorageService is
             dataSetId, payer, info.clientDataSetId, pieceData, nonce, metadataKeys, metadataValues, signature
         );
 
-        uint96 pending =
-            info.pendingOneTimePayments + uint96(ADD_PIECES_BASE_FEE + pieceData.length * ADD_PIECES_PER_PIECE_FEE);
+        uint96 pending = info.pendingOneTimePayments
+            + uint96(
+                (ADD_PIECES_BASE_FEE + pieceData.length * ADD_PIECES_PER_PIECE_FEE)
+                    / CurrencyRegistry.scaleOf(info.currencyId)
+            );
         uint96 reserveBalance = info.lifecycleReserveBalance;
 
         // Validate lockup for the new data set size (fail-fast if client has insufficient funds)
@@ -897,9 +927,12 @@ contract FilecoinWarmStorageService is
         // Verify the signature
         verifySchedulePieceRemovalsSignature(dataSetId, payer, info.clientDataSetId, pieceIds, signature);
 
-        uint96 newPending = info.pendingOneTimePayments + uint96(SCHEDULE_PIECE_REMOVALS_FEE);
+        uint256 scale = CurrencyRegistry.scaleOf(info.currencyId);
+        uint96 newPending = info.pendingOneTimePayments + uint96(SCHEDULE_PIECE_REMOVALS_FEE / scale);
         info.lifecycleReserveBalance = FilecoinPayV1(paymentsContractAddress)
-            .replenishReserveIfNeeded(info.pdpRailId, info.pdpEndEpoch, info.lifecycleReserveBalance, newPending);
+            .replenishReserveIfNeeded(
+                info.pdpRailId, info.pdpEndEpoch, info.lifecycleReserveBalance, newPending, scale
+            );
         info.pendingOneTimePayments = newPending;
 
         // Queue piece IDs for metadata cleanup at nextProvingPeriod
@@ -1098,7 +1131,7 @@ contract FilecoinWarmStorageService is
             bytes memory signature = abi.decode(extraData, (bytes));
             approver = _verifyTerminateServiceSignature(info.payer, dataSetId, signature);
             immediateTermination = true;
-            info.pendingOneTimePayments += uint96(TERMINATE_FEE);
+            info.pendingOneTimePayments += uint96(TERMINATE_FEE / CurrencyRegistry.scaleOf(info.currencyId));
         } else {
             require(
                 msg.sender == info.payer || msg.sender == info.serviceProvider,
@@ -1243,7 +1276,14 @@ contract FilecoinWarmStorageService is
 
         info.lifecycleReserveBalance = FilecoinPayV1(paymentsContractAddress)
             .updateStorageRates(
-                dataSetId, pdpRailId, leafCount, pending, reserveBalance, info.pdpEndEpoch, immediateTermination
+                dataSetId,
+                pdpRailId,
+                leafCount,
+                pending,
+                reserveBalance,
+                info.pdpEndEpoch,
+                immediateTermination,
+                CurrencyRegistry.scaleOf(info.currencyId)
             );
         info.pendingOneTimePayments = 0;
     }
@@ -1327,17 +1367,32 @@ contract FilecoinWarmStorageService is
      * @param extraData The encoded extra data from PDPVerifier
      * @return decoded The decoded DataSetCreateData struct
      */
-    function decodeDataSetCreateData(bytes calldata extraData) internal pure returns (DataSetCreateData memory) {
+    function decodeDataSetCreateData(bytes calldata extraData)
+        internal
+        pure
+        returns (DataSetCreateData memory, address currency)
+    {
+        // Both variants decode with the legacy tuple: the #618 variant appends `address currency`
+        // to the head, which moves every offset by one word without changing what they point to.
         (address payer, uint256 clientDataSetId, string[] memory keys, string[] memory values, bytes memory signature) =
             abi.decode(extraData, (address, uint256, string[], string[], bytes));
 
-        return DataSetCreateData({
-            payer: payer,
-            clientDataSetId: clientDataSetId,
-            metadataKeys: keys,
-            metadataValues: values,
-            signature: signature
-        });
+        // Legacy encodings put the first dynamic field (`keys`) at 0xa0; the variant puts it at 0xc0
+        // and the currency in head word 5.
+        if (uint256(bytes32(extraData[64:96])) != 0xa0) {
+            currency = abi.decode(extraData[160:192], (address));
+        }
+
+        return (
+            DataSetCreateData({
+                payer: payer,
+                clientDataSetId: clientDataSetId,
+                metadataKeys: keys,
+                metadataValues: values,
+                signature: signature
+            }),
+            currency
+        );
     }
 
     /**
@@ -1448,11 +1503,14 @@ contract FilecoinWarmStorageService is
      * @param createData The decoded DataSetCreateData used to build the signature
      * @param payee The service provider address
      */
-    function verifyCreateDataSetSignature(address payee, DataSetCreateData memory createData) internal view {
-        // Compute the EIP-712 digest for the struct hash
+    function verifyCreateDataSetSignature(address payee, DataSetCreateData memory createData, address currency)
+        internal
+        view
+    {
+        // Compute the EIP-712 digest for the struct hash (CreateDataSetWithCurrency when a currency is given)
         bytes32 digest = _hashTypedDataV4(
-            SignatureVerificationLib.createDataSetStructHash(
-                createData.clientDataSetId, payee, createData.metadataKeys, createData.metadataValues
+            SignatureVerificationLib.createDataSetStructHashWithCurrency(
+                createData.clientDataSetId, payee, currency, createData.metadataKeys, createData.metadataValues
             )
         );
 

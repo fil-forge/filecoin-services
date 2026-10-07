@@ -367,4 +367,20 @@ library Errors {
     /// @param requiredEpoch The first epoch at which abandonment is allowed
     /// @param currentBlock The current block number
     error DataSetNotAbandoned(uint256 dataSetId, uint256 requiredEpoch, uint256 currentBlock);
+
+    /// @notice The token is not a whitelisted, enabled payment currency
+    /// @param token The requested token
+    error UnsupportedCurrency(address token);
+
+    /// @notice The token is already the default currency or already whitelisted
+    /// @param token The token
+    error CurrencyAlreadyAdded(address token);
+
+    /// @notice The token's decimals are outside the supported range (6 to 18)
+    /// @param token The token
+    /// @param decimals The token's decimals
+    error InvalidCurrencyDecimals(address token, uint8 decimals);
+
+    /// @notice The whitelist holds the maximum of 255 currencies
+    error TooManyCurrencies();
 }
