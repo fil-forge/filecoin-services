@@ -31,8 +31,12 @@ import {
     LIFECYCLE_RESERVE_TARGET,
     REPLENISH_THRESHOLD,
     SERVICE_COMMISSION_BPS,
-    calculateStorageRate
+    calculateStorageRateAtPrice
 } from "./PriceListUSDFC.sol";
+import {DataSetPricing} from "./DataSetPricing.sol";
+import {SignatureVerificationLib} from "./SignatureVerificationLib.sol";
+import {FilecoinWarmStorageService} from "../FilecoinWarmStorageService.sol";
+import {IPDPVerifier} from "@pdp/interfaces/IPDPVerifier.sol";
 
 event CDNPaymentRailsToppedUp(
     uint256 indexed dataSetId,
@@ -316,7 +320,8 @@ library Rails {
         bool immediateTermination
     ) public returns (uint96 newReserveBalance) {
         uint256 scale = currencyScale(dataSetId);
-        uint256 newStorageRatePerEpoch = calculateStorageRate(leafCount, scale);
+        uint256 newStorageRatePerEpoch =
+            calculateStorageRateAtPrice(leafCount, DataSetPricing.effectiveStoragePrice(dataSetId));
         if (immediateTermination) {
             // No try/catch: immediateTermination implies the payer consented and is solvent.
             payments.modifyRailLockup(pdpRailId, 0, pending);
@@ -393,5 +398,53 @@ library Rails {
             $.currencies[currencyId].enabled = enabled;
         }
         emit CurrencyEnabledSet(uint8(currencyId), token, enabled);
+    }
+
+    /// @notice Changes a data set's storage price by mutual consent and re-prices its rail.
+    /// @dev Body of FilecoinWarmStorageService.updateStoragePrice, kept here so the FWSS core carries only a
+    ///      forwarding stub. Runs by DELEGATECALL in the proxy: msg.sender is the original caller, `info` is
+    ///      the proxy's DataSetInfo, and immutables are read back through the proxy's public getters.
+    function updateStoragePrice(
+        FilecoinWarmStorageService.DataSetInfo storage info,
+        uint256 dataSetId,
+        uint256 storagePricePerTibPerMonth,
+        uint256 nonce,
+        bytes calldata signature,
+        address authorizer,
+        bytes32 domainSeparator
+    ) public {
+        uint256 pdpRailId = info.pdpRailId;
+        if (pdpRailId == 0) revert Errors.InvalidDataSetId(dataSetId);
+        if (info.pdpEndEpoch != 0) revert Errors.DataSetPaymentAlreadyTerminated(dataSetId);
+        address serviceProvider = info.serviceProvider;
+        if (msg.sender != serviceProvider) {
+            revert Errors.CallerNotServiceProvider(dataSetId, serviceProvider, msg.sender);
+        }
+
+        FilecoinWarmStorageService self = FilecoinWarmStorageService(address(this));
+        SignatureVerificationLib.verifyUpdateStoragePriceAuthorization(
+            info.payer,
+            dataSetId,
+            authorizer,
+            nonce,
+            storagePricePerTibPerMonth,
+            signature,
+            domainSeparator,
+            self.sessionKeyRegistry()
+        );
+        DataSetPricing.updatePrice(dataSetId, storagePricePerTibPerMonth, nonce);
+
+        // Re-price now so an idle data set picks up the new price; applies from the next epoch.
+        info.lifecycleReserveBalance = updateStorageRates(
+            FilecoinPayV1(self.paymentsContractAddress()),
+            dataSetId,
+            pdpRailId,
+            IPDPVerifier(self.pdpVerifierAddress()).getDataSetLeafCount(dataSetId),
+            info.pendingOneTimePayments,
+            info.lifecycleReserveBalance,
+            0,
+            false
+        );
+        info.pendingOneTimePayments = 0;
     }
 }

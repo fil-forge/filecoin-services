@@ -19,6 +19,7 @@ import {CURRENCY_REGISTRY_SLOT} from "./CurrencyRegistry.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "./FilecoinWarmStorageServiceLayout.sol" as StorageLayout;
+import {DATA_SET_PRICING_STORAGE_SLOT} from "./DataSetPricing.sol";
 
 // bytes32(bytes4(keccak256(abi.encodePacked("extsloadStruct(bytes32,uint256)"))));
 bytes32 constant EXTSLOAD_STRUCT_SELECTOR = 0x5379a43500000000000000000000000000000000000000000000000000000000;
@@ -249,6 +250,23 @@ library FilecoinWarmStorageServiceStateInternalLibrary {
 
     function railToDataSet(FilecoinWarmStorageService service, uint256 railId) internal view returns (uint256) {
         return uint256(service.extsload(keccak256(abi.encode(railId, StorageLayout.RAIL_TO_DATA_SET_SLOT))));
+    }
+
+    /**
+     * @notice Client-agreed storage price of a data set
+     * @param service The service contract
+     * @param dataSetId The data set ID
+     * @return storagePricePerTibPerMonth Agreed price in the data set's token units; 0 means the posted price
+     * @return nonce Accepted price updates so far; the next UpdateStoragePrice signature signs this value
+     */
+    function getDataSetStoragePrice(FilecoinWarmStorageService service, uint256 dataSetId)
+        internal
+        view
+        returns (uint256 storagePricePerTibPerMonth, uint256 nonce)
+    {
+        uint256 word = uint256(service.extsload(keccak256(abi.encode(dataSetId, DATA_SET_PRICING_STORAGE_SLOT))));
+        storagePricePerTibPerMonth = uint128(word);
+        nonce = uint64(word >> 128);
     }
 
     function getDataSetAuthorizer(FilecoinWarmStorageService service, uint256 dataSetId)

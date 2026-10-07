@@ -5,6 +5,14 @@ import {Cids} from "@pdp/Cids.sol";
 import {SessionKeyRegistry} from "@session-key-registry/SessionKeyRegistry.sol";
 import {Errors} from "../Errors.sol";
 import {IDataSetAuthorizer} from "../interfaces/IDataSetAuthorizer.sol";
+import {DataSetPricing} from "./DataSetPricing.sol";
+
+/// @dev ABI offset of `keys` in the CreateDataSetWithPayment extraData variant
+///      abi.encode(payer, clientDataSetId, keys, values, signature, token, storagePricePerTibPerMonth):
+///      a seven-word head. Standard encoders put `keys` of the legacy five-field encoding at 0xa0. A
+///      non-standard encoding that lands on 0xe0 is verified against the CreateDataSetWithPayment type hash,
+///      so it fails without a signature over that type.
+uint256 constant CREATE_DATA_SET_WITH_PAYMENT_KEYS_OFFSET = 0xe0;
 
 /// @title SignatureVerificationLib
 /// @notice Library for EIP-712 signature verification and metadata hashing
@@ -43,6 +51,17 @@ library SignatureVerificationLib {
         keccak256("SchedulePieceRemovals(uint256 clientDataSetId,uint256[] pieceIds)");
 
     bytes32 internal constant TERMINATE_SERVICE_TYPEHASH = keccak256("TerminateService(uint256 dataSetId)");
+
+    /// @dev CreateDataSet plus payment terms (#618 token, #619 storage price). Carried by the extraData
+    ///      variant whose head has seven words. token == address(0) means the deployment's default token;
+    ///      storagePricePerTibPerMonth == 0 means the posted price.
+    bytes32 internal constant CREATE_DATA_SET_WITH_PAYMENT_TYPEHASH = keccak256(
+        "CreateDataSetWithPayment(uint256 clientDataSetId,address payee,MetadataEntry[] metadata,address token,"
+        "uint256 storagePricePerTibPerMonth)" "MetadataEntry(string key,string value)"
+    );
+
+    bytes32 internal constant UPDATE_STORAGE_PRICE_TYPEHASH =
+        keccak256("UpdateStoragePrice(uint256 dataSetId,uint256 nonce,uint256 storagePricePerTibPerMonth)");
 
     // ============================================================================
     // Metadata Hashing Functions
@@ -319,6 +338,110 @@ library SignatureVerificationLib {
         }
 
         return _verifyAuthorizer(payer, signature, digest, TERMINATE_SERVICE_TYPEHASH, dataSetId, authorizer, bytes(""));
+    }
+
+    /// @notice Verifies the payer's signature over data set creation extraData, in either variant, and
+    ///         records the agreed storage price for the CreateDataSetWithPayment variant.
+    /// @dev Legacy variant: CreateDataSet(clientDataSetId, payee, metadata), unchanged. New variant (keys at
+    ///      offset 0xe0): CreateDataSetWithPayment(clientDataSetId, payee, metadata, token,
+    ///      storagePricePerTibPerMonth). token must be zero or `defaultToken` (single-token deployment; #618
+    ///      would widen this). A session key needs the type hash of the variant it signs.
+    function verifyCreateDataSet(
+        bytes calldata extraData,
+        uint256 dataSetId,
+        address payee,
+        address defaultToken,
+        bytes32 domainSeparator,
+        SessionKeyRegistry sessionKeyRegistry
+    ) public {
+        (address payer, uint256 clientDataSetId, string[] memory keys, string[] memory values,) =
+            abi.decode(extraData, (address, uint256, string[], string[], bytes));
+        bytes32 metadataHash = _hashMetadataEntriesMemory(keys, values);
+        // The signature as a calldata slice, for recoverSigner.
+        uint256 sigOffset = uint256(bytes32(extraData[128:160]));
+        uint256 sigLength = uint256(bytes32(extraData[sigOffset:sigOffset + 32]));
+        bytes calldata signature = extraData[sigOffset + 32:sigOffset + 32 + sigLength];
+
+        if (uint256(bytes32(extraData[64:96])) != CREATE_DATA_SET_WITH_PAYMENT_KEYS_OFFSET) {
+            _verifySignature(
+                payer,
+                signature,
+                _toTypedDataHash(
+                    domainSeparator,
+                    keccak256(abi.encode(CREATE_DATA_SET_TYPEHASH, clientDataSetId, payee, metadataHash))
+                ),
+                CREATE_DATA_SET_TYPEHASH,
+                sessionKeyRegistry
+            );
+            return;
+        }
+
+        (address token, uint256 storagePricePerTibPerMonth) = abi.decode(extraData[160:224], (address, uint256));
+        if (token != address(0) && token != defaultToken) revert Errors.UnsupportedPaymentToken(token);
+        _verifySignature(
+            payer,
+            signature,
+            _toTypedDataHash(
+                domainSeparator,
+                keccak256(
+                    abi.encode(
+                        CREATE_DATA_SET_WITH_PAYMENT_TYPEHASH,
+                        clientDataSetId,
+                        payee,
+                        metadataHash,
+                        token,
+                        storagePricePerTibPerMonth
+                    )
+                )
+            ),
+            CREATE_DATA_SET_WITH_PAYMENT_TYPEHASH,
+            sessionKeyRegistry
+        );
+        DataSetPricing.setPrice(dataSetId, storagePricePerTibPerMonth);
+    }
+
+    function _hashMetadataEntriesMemory(string[] memory keys, string[] memory values) private pure returns (bytes32) {
+        require(keys.length == values.length, Errors.MetadataKeyAndValueLengthMismatch(keys.length, values.length));
+        bytes32[] memory entryHashes = new bytes32[](keys.length);
+        for (uint256 i = 0; i < keys.length; i++) {
+            entryHashes[i] =
+                keccak256(abi.encode(METADATA_ENTRY_TYPEHASH, keccak256(bytes(keys[i])), keccak256(bytes(values[i]))));
+        }
+        return keccak256(abi.encodePacked(entryHashes));
+    }
+
+    /// @notice Verifies and authorizes an UpdateStoragePrice operation.
+    /// @dev Internal: compiled into Rails.updateStoragePrice, which runs in the FWSS proxy's context, so the
+    ///      authorizer reentrancy latch below shares the proxy's transient slot as for the other operations.
+    function verifyUpdateStoragePriceAuthorization(
+        address payer,
+        uint256 dataSetId,
+        address authorizer,
+        uint256 nonce,
+        uint256 storagePricePerTibPerMonth,
+        bytes calldata signature,
+        bytes32 domainSeparator,
+        SessionKeyRegistry sessionKeyRegistry
+    ) internal {
+        bytes32 digest = _toTypedDataHash(
+            domainSeparator,
+            keccak256(abi.encode(UPDATE_STORAGE_PRICE_TYPEHASH, dataSetId, nonce, storagePricePerTibPerMonth))
+        );
+
+        if (authorizer == address(0)) {
+            _verifySignature(payer, signature, digest, UPDATE_STORAGE_PRICE_TYPEHASH, sessionKeyRegistry);
+            return;
+        }
+
+        _verifyAuthorizer(
+            payer,
+            signature,
+            digest,
+            UPDATE_STORAGE_PRICE_TYPEHASH,
+            dataSetId,
+            authorizer,
+            abi.encode(nonce, storagePricePerTibPerMonth)
+        );
     }
 
     /// @notice Gas ceiling for the authorizer subcall.

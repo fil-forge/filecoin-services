@@ -51,7 +51,22 @@ uint256 constant REPLENISH_THRESHOLD = (25 * 10 ** TOKEN_DECIMALS) / 1000; // $0
  * @return ratePerEpoch The calculated rate per epoch in the token's smallest unit
  */
 function calculateStorageSizeBasedRatePerEpoch(uint256 totalBytes) pure returns (uint256 ratePerEpoch) {
-    uint256 numerator = totalBytes * STORAGE_PRICE_PER_TIB_PER_MONTH;
+    return calculateStorageSizeBasedRatePerEpochAtPrice(totalBytes, STORAGE_PRICE_PER_TIB_PER_MONTH);
+}
+
+/**
+ * @notice Calculate a per-epoch rate for a given storage price per TiB per month
+ * @dev The price applies to the size-proportional term only; the per-dataset fee is always the posted
+ *      DATASET_FEE_PER_EPOCH.
+ * @param totalBytes Total size of the stored data in bytes
+ * @param storagePricePerTibPerMonth Storage price in the token's smallest unit
+ * @return ratePerEpoch The calculated rate per epoch in the token's smallest unit
+ */
+function calculateStorageSizeBasedRatePerEpochAtPrice(uint256 totalBytes, uint256 storagePricePerTibPerMonth)
+    pure
+    returns (uint256 ratePerEpoch)
+{
+    uint256 numerator = totalBytes * storagePricePerTibPerMonth;
     uint256 denominator = TIB_IN_BYTES * EPOCHS_PER_MONTH;
 
     return numerator / denominator + DATASET_FEE_PER_EPOCH;
@@ -63,8 +78,21 @@ function calculateStorageSizeBasedRatePerEpoch(uint256 totalBytes) pure returns 
  * @return storageRatePerEpoch The storage rate per epoch
  */
 function calculateStorageRate(uint256 leafCount) pure returns (uint256 storageRatePerEpoch) {
+    return calculateStorageRateAtPrice(leafCount, STORAGE_PRICE_PER_TIB_PER_MONTH);
+}
+
+/**
+ * @notice Calculate the storage rate per epoch at an agreed storage price
+ * @param leafCount the count of the 32b leaves in the FRC-0069 tree
+ * @param storagePricePerTibPerMonth Storage price in the token's smallest unit
+ * @return storageRatePerEpoch The storage rate per epoch
+ */
+function calculateStorageRateAtPrice(uint256 leafCount, uint256 storagePricePerTibPerMonth)
+    pure
+    returns (uint256 storageRatePerEpoch)
+{
     if (leafCount == 0) return 0;
-    return calculateStorageSizeBasedRatePerEpoch(Cids.leafCountToRawSize(leafCount));
+    return calculateStorageSizeBasedRatePerEpochAtPrice(Cids.leafCountToRawSize(leafCount), storagePricePerTibPerMonth);
 }
 
 /**

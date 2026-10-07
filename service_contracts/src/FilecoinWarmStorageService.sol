@@ -614,8 +614,11 @@ contract FilecoinWarmStorageService is
         clientNonces[createData.payer][createData.clientDataSetId] = dataSetId;
         clientDataSets[createData.payer].push(dataSetId);
 
-        // Verify the client's signature
-        verifyCreateDataSetSignature(payee, createData, currency);
+        // Verify the client's signature over either extraData variant; the CreateDataSetWithPayment
+        // variant also records the agreed storage price (#619) and checks the token (#618).
+        SignatureVerificationLib.verifyCreateDataSet(
+            extraData, dataSetId, payee, address(usdfcTokenAddress), _domainSeparatorV4(), sessionKeyRegistry
+        );
         uint16 currencyCode = DEFAULT_CURRENCY_CODE;
         if (currency != address(0)) {
             currencyCode = Rails.resolveCurrency(currency);
@@ -1187,6 +1190,33 @@ contract FilecoinWarmStorageService is
     }
 
     /**
+     * @notice Changes a data set's storage price by mutual consent
+     * @dev The service provider submits; the payer (or its session key, or the data set's authorizer) signs
+     *      UpdateStoragePrice(dataSetId, nonce, storagePricePerTibPerMonth). The rail is re-priced in the same
+     *      call and the new rate applies from the next epoch. 0 restores the posted price.
+     * @param dataSetId The data set ID
+     * @param storagePricePerTibPerMonth New agreed price in the data set's token units (0 = posted price)
+     * @param nonce The data set's current price-update nonce
+     * @param signature The payer's EIP-712 signature
+     */
+    function updateStoragePrice(
+        uint256 dataSetId,
+        uint256 storagePricePerTibPerMonth,
+        uint256 nonce,
+        bytes calldata signature
+    ) external {
+        Rails.updateStoragePrice(
+            dataSetInfo[dataSetId],
+            dataSetId,
+            storagePricePerTibPerMonth,
+            nonce,
+            signature,
+            dataSetAuthorizer[dataSetId],
+            _domainSeparatorV4()
+        );
+    }
+
+    /**
      * @notice Settles CDN payment rails with specified amounts
      * @dev Only callable by FilCDN (Operator) contract
      * @param dataSetId The ID of the data set
@@ -1514,28 +1544,6 @@ contract FilecoinWarmStorageService is
     }
 
     // ============ Metadata Hashing Functions ============
-
-    /**
-     * @notice Verifies a signature for the CreateDataSet operation
-     * @param createData The decoded DataSetCreateData used to build the signature
-     * @param payee The service provider address
-     */
-    function verifyCreateDataSetSignature(address payee, DataSetCreateData memory createData, address currency)
-        internal
-        view
-    {
-        // Compute the EIP-712 digest for the struct hash (CreateDataSetWithCurrency when a currency is given)
-        bytes32 digest = _hashTypedDataV4(
-            SignatureVerificationLib.createDataSetStructHashWithCurrency(
-                createData.clientDataSetId, payee, currency, createData.metadataKeys, createData.metadataValues
-            )
-        );
-
-        // Delegate to library for verification
-        SignatureVerificationLib.verifyCreateDataSetSignature(
-            createData.payer, createData.signature, digest, sessionKeyRegistry
-        );
-    }
 
     /**
      * @notice Verifies a signature for the AddPieces operation
