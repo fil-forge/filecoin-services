@@ -6,6 +6,7 @@ import {SessionKeyRegistry} from "@session-key-registry/SessionKeyRegistry.sol";
 import {Errors} from "../Errors.sol";
 import {IDataSetAuthorizer} from "../interfaces/IDataSetAuthorizer.sol";
 import {DataSetPricing} from "./DataSetPricing.sol";
+import {CurrencyRegistry} from "./CurrencyRegistry.sol";
 
 /// @dev ABI offset of `keys` in the CreateDataSetWithPayment extraData variant
 ///      abi.encode(payer, clientDataSetId, keys, values, signature, token, storagePricePerTibPerMonth):
@@ -27,13 +28,6 @@ library SignatureVerificationLib {
 
     bytes32 internal constant CREATE_DATA_SET_TYPEHASH = keccak256(
         "CreateDataSet(uint256 clientDataSetId,address payee,MetadataEntry[] metadata)MetadataEntry(string key,string value)"
-    );
-
-    /// @dev #618: the payer signs the payment currency. Session keys authorize it under the
-    ///      CREATE_DATA_SET_TYPEHASH permission; FilecoinPay operator approvals are per token.
-    bytes32 internal constant CREATE_DATA_SET_WITH_CURRENCY_TYPEHASH = keccak256(
-        "CreateDataSetWithCurrency(uint256 clientDataSetId,address payee,address currency,MetadataEntry[] metadata)"
-        "MetadataEntry(string key,string value)"
     );
 
     bytes32 internal constant CID_TYPEHASH = keccak256("Cid(bytes data)");
@@ -102,25 +96,6 @@ library SignatureVerificationLib {
         return keccak256(
             abi.encode(CREATE_DATA_SET_TYPEHASH, clientDataSetId, payee, hashMetadataEntries(keys, values))
         );
-    }
-
-    /// @notice Struct hash for either CreateDataSet variant.
-    /// @param currency address(0) for the legacy CreateDataSet message, else the payment token
-    function createDataSetStructHashWithCurrency(
-        uint256 clientDataSetId,
-        address payee,
-        address currency,
-        string[] calldata keys,
-        string[] calldata values
-    ) public pure returns (bytes32 structHash) {
-        bytes32 metadataHash = hashMetadataEntries(keys, values);
-        if (currency == address(0)) {
-            return keccak256(abi.encode(CREATE_DATA_SET_TYPEHASH, clientDataSetId, payee, metadataHash));
-        }
-        return
-            keccak256(
-                abi.encode(CREATE_DATA_SET_WITH_CURRENCY_TYPEHASH, clientDataSetId, payee, currency, metadataHash)
-            );
     }
 
     function hashAllCids(Cids.Cid[] calldata pieceDataArray) internal pure returns (bytes32 cidHashesHash) {
@@ -340,20 +315,25 @@ library SignatureVerificationLib {
         return _verifyAuthorizer(payer, signature, digest, TERMINATE_SERVICE_TYPEHASH, dataSetId, authorizer, bytes(""));
     }
 
-    /// @notice Verifies the payer's signature over data set creation extraData, in either variant, and
-    ///         records the agreed storage price for the CreateDataSetWithPayment variant.
-    /// @dev Legacy variant: CreateDataSet(clientDataSetId, payee, metadata), unchanged. New variant (keys at
-    ///      offset 0xe0): CreateDataSetWithPayment(clientDataSetId, payee, metadata, token,
-    ///      storagePricePerTibPerMonth). token must be zero or `defaultToken` (single-token deployment; #618
-    ///      would widen this). A session key needs the type hash of the variant it signs.
+    /// @notice Verifies the payer's signature over data set creation extraData, in either variant, resolves
+    ///         the payment currency (#618) and records the agreed storage price (#619).
+    /// @dev Legacy variant: CreateDataSet(clientDataSetId, payee, metadata), unchanged, pays in the default
+    ///      token. New variant (keys at offset 0xe0): CreateDataSetWithPayment(clientDataSetId, payee, metadata,
+    ///      token, storagePricePerTibPerMonth). token 0 or `defaultToken` is the default currency; any other
+    ///      token must be whitelisted and enabled. The price is in that token's units; 0 means the posted price.
+    ///      Session keys: choosing a currency at the posted price needs only the CreateDataSet permission
+    ///      (FilecoinPay operator approvals are per token); signing a price needs CreateDataSetWithPayment.
+    /// @return token The rail token
+    /// @return currencyCode Value for DataSetInfo.currency: whitelist id | (18 - decimals) << 8
     function verifyCreateDataSet(
         bytes calldata extraData,
         uint256 dataSetId,
         address payee,
         address defaultToken,
+        uint16 defaultCurrencyCode,
         bytes32 domainSeparator,
         SessionKeyRegistry sessionKeyRegistry
-    ) public {
+    ) public returns (address token, uint16 currencyCode) {
         (address payer, uint256 clientDataSetId, string[] memory keys, string[] memory values,) =
             abi.decode(extraData, (address, uint256, string[], string[], bytes));
         bytes32 metadataHash = _hashMetadataEntriesMemory(keys, values);
@@ -373,11 +353,11 @@ library SignatureVerificationLib {
                 CREATE_DATA_SET_TYPEHASH,
                 sessionKeyRegistry
             );
-            return;
+            return (defaultToken, defaultCurrencyCode);
         }
 
-        (address token, uint256 storagePricePerTibPerMonth) = abi.decode(extraData[160:224], (address, uint256));
-        if (token != address(0) && token != defaultToken) revert Errors.UnsupportedPaymentToken(token);
+        uint256 storagePricePerTibPerMonth;
+        (token, storagePricePerTibPerMonth) = abi.decode(extraData[160:224], (address, uint256));
         _verifySignature(
             payer,
             signature,
@@ -394,10 +374,16 @@ library SignatureVerificationLib {
                     )
                 )
             ),
-            CREATE_DATA_SET_WITH_PAYMENT_TYPEHASH,
+            storagePricePerTibPerMonth == 0 ? CREATE_DATA_SET_TYPEHASH : CREATE_DATA_SET_WITH_PAYMENT_TYPEHASH,
             sessionKeyRegistry
         );
-        DataSetPricing.setPrice(dataSetId, storagePricePerTibPerMonth);
+        if (token == address(0) || token == defaultToken) {
+            token = defaultToken;
+            currencyCode = defaultCurrencyCode;
+        } else {
+            currencyCode = CurrencyRegistry.resolve(token);
+        }
+        DataSetPricing.setPrice(dataSetId, storagePricePerTibPerMonth, CurrencyRegistry.scale(currencyCode));
     }
 
     function _hashMetadataEntriesMemory(string[] memory keys, string[] memory values) private pure returns (bytes32) {

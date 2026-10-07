@@ -321,7 +321,7 @@ library Rails {
     ) public returns (uint96 newReserveBalance) {
         uint256 scale = currencyScale(dataSetId);
         uint256 newStorageRatePerEpoch =
-            calculateStorageRateAtPrice(leafCount, DataSetPricing.effectiveStoragePrice(dataSetId));
+            calculateStorageRateAtPrice(leafCount, DataSetPricing.effectiveStoragePrice(dataSetId, scale), scale);
         if (immediateTermination) {
             // No try/catch: immediateTermination implies the payer consented and is solvent.
             payments.modifyRailLockup(pdpRailId, 0, pending);
@@ -349,21 +349,6 @@ library Rails {
             let shift := and(shr(200, sload(add(keccak256(0, 0x40), 10))), 0xff) // currency code bits 8-15
             scale := exp(10, shift)
         }
-    }
-
-    /// @notice Currency code of a requested token: id | (18 - decimals) << 8. The default token is id 0;
-    ///         any other token must be whitelisted and enabled.
-    /// @dev The code is stored as `DataSetInfo.currency`.
-    function resolveCurrency(address token) public view returns (uint16 code) {
-        // A variant request naming the default token is the default currency (id 0)
-        if (token == IDefaultCurrency(address(this)).usdfcTokenAddress()) {
-            return uint16(MAX_CURRENCY_DECIMALS - IERC20Metadata(token).decimals()) << 8;
-        }
-        CurrencyRegistryStorage storage $ = CurrencyRegistry.layout();
-        uint256 id = $.ids[token];
-        Currency storage c = $.currencies[id];
-        require(id != 0 && c.enabled, Errors.UnsupportedCurrency(token));
-        return uint16(id) | (uint16(MAX_CURRENCY_DECIMALS - c.decimals) << 8);
     }
 
     // ---------------------------------------------------------------------
@@ -432,7 +417,7 @@ library Rails {
             domainSeparator,
             self.sessionKeyRegistry()
         );
-        DataSetPricing.updatePrice(dataSetId, storagePricePerTibPerMonth, nonce);
+        DataSetPricing.updatePrice(dataSetId, storagePricePerTibPerMonth, nonce, currencyScale(dataSetId));
 
         // Re-price now so an idle data set picks up the new price; applies from the next epoch.
         info.lifecycleReserveBalance = updateStorageRates(

@@ -393,8 +393,4 @@ library Errors {
     /// @param expected The data set's current nonce
     /// @param actual The nonce supplied (and signed)
     error InvalidStoragePriceNonce(uint256 dataSetId, uint256 expected, uint256 actual);
-
-    /// @notice The data set creation names a token this deployment does not accept
-    /// @param token The requested token
-    error UnsupportedPaymentToken(address token);
 }

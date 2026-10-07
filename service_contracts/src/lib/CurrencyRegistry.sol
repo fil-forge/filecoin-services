@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 pragma solidity ^0.8.20;
 
+import {Errors} from "../Errors.sol";
+
 /// @dev ERC-7201 location of {CurrencyRegistryStorage}:
 ///      keccak256(abi.encode(uint256(keccak256("fwss.storage.currencies")) - 1)) & ~bytes32(uint256(0xff))
 bytes32 constant CURRENCY_REGISTRY_SLOT = 0xce14d13e508ebe613422ae6621b56280fb248a730a4c1776e0b3bd40cac71400;
@@ -41,5 +43,20 @@ library CurrencyRegistry {
         assembly ("memory-safe") {
             $.slot := CURRENCY_REGISTRY_SLOT
         }
+    }
+
+    /// @notice Currency code of a whitelisted, enabled token: id | (18 - decimals) << 8.
+    /// @dev The default token (id 0) is resolved by the caller. The code is stored as DataSetInfo.currency.
+    function resolve(address token) internal view returns (uint16 code) {
+        CurrencyRegistryStorage storage $ = layout();
+        uint256 id = $.ids[token];
+        Currency storage c = $.currencies[id];
+        require(id != 0 && c.enabled, Errors.UnsupportedCurrency(token));
+        return uint16(id) | (uint16(MAX_CURRENCY_DECIMALS - c.decimals) << 8);
+    }
+
+    /// @notice Divisor from the 18-decimal price list to the units of the currency with this code.
+    function scale(uint256 currencyCode) internal pure returns (uint256) {
+        return 10 ** (currencyCode >> 8);
     }
 }

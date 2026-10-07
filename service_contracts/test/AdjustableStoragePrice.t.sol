@@ -2,9 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {Cids} from "@pdp/Cids.sol";
-import {FilecoinPayV1} from "@fws-payments/FilecoinPayV1.sol";
 import {FilecoinWarmStorageServiceTest, TestDataSetAuthorizer} from "./FilecoinWarmStorageService.t.sol";
-import {FilecoinWarmStorageService} from "../src/FilecoinWarmStorageService.sol";
 import {Errors} from "../src/Errors.sol";
 import {DATA_SET_PRICING_STORAGE_SLOT, DataSetStoragePriceSet} from "../src/lib/DataSetPricing.sol";
 import {
@@ -52,7 +50,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
     function _initPayer() private {
         (payer, payerKey) = makeAddrAndKey("fil1276-payer");
         (sessionSigner, sessionSignerKey) = makeAddrAndKey("fil1276-session-key");
-        mockUSDFC.transfer(payer, 1000e18);
+        require(mockUSDFC.transfer(payer, 1000e18));
         vm.startPrank(payer);
         payments.setOperatorApproval(mockUSDFC, address(pdpServiceWithPayments), true, 1000e18, 1000e18, 365 days);
         mockUSDFC.approve(address(payments), 1000e18);

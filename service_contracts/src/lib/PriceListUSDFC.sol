@@ -78,34 +78,26 @@ function calculateStorageSizeBasedRatePerEpochAtPrice(uint256 totalBytes, uint25
  * @return storageRatePerEpoch The storage rate per epoch
  */
 function calculateStorageRate(uint256 leafCount) pure returns (uint256 storageRatePerEpoch) {
-    return calculateStorageRateAtPrice(leafCount, STORAGE_PRICE_PER_TIB_PER_MONTH);
+    return calculateStorageRateAtPrice(leafCount, STORAGE_PRICE_PER_TIB_PER_MONTH, 1);
 }
 
 /**
- * @notice Calculate the storage rate per epoch at an agreed storage price
+ * @notice Calculate the storage rate per epoch at a storage price, in a currency whose amounts are
+ *         `amount18 / scale` (#618, #619)
+ * @dev Each term is truncated separately, so a 6-decimal currency at the posted price is charged exactly
+ *      what a price list written at 6 decimals would charge (size term plus one unit of dataset fee).
  * @param leafCount the count of the 32b leaves in the FRC-0069 tree
  * @param storagePricePerTibPerMonth Storage price in the token's smallest unit
+ * @param scale 10 ** (18 - token decimals)
  * @return storageRatePerEpoch The storage rate per epoch
  */
-function calculateStorageRateAtPrice(uint256 leafCount, uint256 storagePricePerTibPerMonth)
+function calculateStorageRateAtPrice(uint256 leafCount, uint256 storagePricePerTibPerMonth, uint256 scale)
     pure
     returns (uint256 storageRatePerEpoch)
 {
     if (leafCount == 0) return 0;
-    return calculateStorageSizeBasedRatePerEpochAtPrice(Cids.leafCountToRawSize(leafCount), storagePricePerTibPerMonth);
-}
-
-/**
- * @notice Storage rate per epoch in a currency whose amounts are `amount18 / scale`
- * @dev Each term is truncated separately, so a 6-decimal currency is charged exactly what a
- *      price list written at 6 decimals would charge (size term plus one unit of dataset fee).
- * @param leafCount the count of the 32b leaves in the FRC-0069 tree
- * @param scale 10 ** (18 - token decimals)
- */
-function calculateStorageRate(uint256 leafCount, uint256 scale) pure returns (uint256 storageRatePerEpoch) {
-    if (leafCount == 0) return 0;
-    return (Cids.leafCountToRawSize(leafCount) * STORAGE_PRICE_PER_TIB_PER_MONTH)
-        / (TIB_IN_BYTES * EPOCHS_PER_MONTH * scale) + DATASET_FEE_PER_EPOCH / scale;
+    return (Cids.leafCountToRawSize(leafCount) * storagePricePerTibPerMonth) / (TIB_IN_BYTES * EPOCHS_PER_MONTH)
+        + DATASET_FEE_PER_EPOCH / scale;
 }
 
 /**

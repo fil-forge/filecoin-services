@@ -41,32 +41,35 @@ library DataSetPricing {
         }
     }
 
-    /// @notice Price used for the size-proportional rate: the agreed price, never below the posted price.
-    function effectiveStoragePrice(uint256 dataSetId) internal view returns (uint256 price) {
+    /// @notice Price used for the size-proportional rate, in the data set's token units: the agreed price,
+    ///         never below the posted price.
+    /// @param scale Divisor from the 18-decimal price list to the data set's token units (#618)
+    function effectiveStoragePrice(uint256 dataSetId, uint256 scale) internal view returns (uint256 price) {
         price = layout().prices[dataSetId].storagePricePerTibPerMonth;
-        if (price < STORAGE_PRICE_PER_TIB_PER_MONTH) {
-            price = STORAGE_PRICE_PER_TIB_PER_MONTH;
+        uint256 posted = STORAGE_PRICE_PER_TIB_PER_MONTH / scale;
+        if (price < posted) {
+            price = posted;
         }
     }
 
     /// @notice Records the price signed at creation. Does not consume a nonce.
-    function setPrice(uint256 dataSetId, uint256 storagePricePerTibPerMonth) internal {
-        _store(layout().prices[dataSetId], dataSetId, storagePricePerTibPerMonth);
+    function setPrice(uint256 dataSetId, uint256 storagePricePerTibPerMonth, uint256 scale) internal {
+        _store(layout().prices[dataSetId], dataSetId, storagePricePerTibPerMonth, scale);
     }
 
     /// @notice Records a mutually agreed price change, consuming `nonce`.
-    function updatePrice(uint256 dataSetId, uint256 storagePricePerTibPerMonth, uint256 nonce) internal {
+    function updatePrice(uint256 dataSetId, uint256 storagePricePerTibPerMonth, uint256 nonce, uint256 scale) internal {
         Price storage p = layout().prices[dataSetId];
         uint64 current = p.nonce;
         if (nonce != current) revert Errors.InvalidStoragePriceNonce(dataSetId, current, nonce);
         p.nonce = current + 1;
-        _store(p, dataSetId, storagePricePerTibPerMonth);
+        _store(p, dataSetId, storagePricePerTibPerMonth, scale);
     }
 
-    function _store(Price storage p, uint256 dataSetId, uint256 storagePricePerTibPerMonth) private {
+    function _store(Price storage p, uint256 dataSetId, uint256 storagePricePerTibPerMonth, uint256 scale) private {
         if (
             storagePricePerTibPerMonth != 0
-                && (storagePricePerTibPerMonth < STORAGE_PRICE_PER_TIB_PER_MONTH
+                && (storagePricePerTibPerMonth < STORAGE_PRICE_PER_TIB_PER_MONTH / scale
                     || storagePricePerTibPerMonth > type(uint128).max)
         ) {
             revert Errors.InvalidStoragePrice(storagePricePerTibPerMonth);

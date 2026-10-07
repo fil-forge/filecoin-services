@@ -595,7 +595,7 @@ contract FilecoinWarmStorageService is
             len <= MAX_CREATE_DATA_SET_EXTRA_DATA_SIZE,
             Errors.ExtraDataTooLarge(len, MAX_CREATE_DATA_SET_EXTRA_DATA_SIZE)
         );
-        (DataSetCreateData memory createData, address currency) = decodeDataSetCreateData(extraData);
+        DataSetCreateData memory createData = decodeDataSetCreateData(extraData);
 
         // Validate the addresses
         require(createData.payer != address(0), Errors.ZeroAddress(Errors.AddressField.Payer));
@@ -614,15 +614,17 @@ contract FilecoinWarmStorageService is
         clientNonces[createData.payer][createData.clientDataSetId] = dataSetId;
         clientDataSets[createData.payer].push(dataSetId);
 
-        // Verify the client's signature over either extraData variant; the CreateDataSetWithPayment
-        // variant also records the agreed storage price (#619) and checks the token (#618).
-        SignatureVerificationLib.verifyCreateDataSet(
-            extraData, dataSetId, payee, address(usdfcTokenAddress), _domainSeparatorV4(), sessionKeyRegistry
+        // Verify the client's signature over either extraData variant. The CreateDataSetWithPayment variant
+        // also selects the payment token (#618) and records the agreed storage price (#619).
+        (address token, uint16 currencyCode) = SignatureVerificationLib.verifyCreateDataSet(
+            extraData,
+            dataSetId,
+            payee,
+            address(usdfcTokenAddress),
+            DEFAULT_CURRENCY_CODE,
+            _domainSeparatorV4(),
+            sessionKeyRegistry
         );
-        uint16 currencyCode = DEFAULT_CURRENCY_CODE;
-        if (currency != address(0)) {
-            currencyCode = Rails.resolveCurrency(currency);
-        }
 
         // Initialize the DataSetInfo struct
         DataSetInfo storage info = dataSetInfo[dataSetId];
@@ -674,11 +676,7 @@ contract FilecoinWarmStorageService is
         bool hasCDN = hasCDNMetadataKey(createData.metadataKeys);
 
         (uint256 pdpRailId, uint256 cacheMissRailId, uint256 cdnRailId) = payments.createRails(
-            dataSetId,
-            currency == address(0) ? usdfcTokenAddress : IERC20(currency),
-            createData.payer,
-            payee,
-            hasCDN ? filBeamBeneficiaryAddress : address(0)
+            dataSetId, IERC20(token), createData.payer, payee, hasCDN ? filBeamBeneficiaryAddress : address(0)
         );
 
         railToDataSet[pdpRailId] = dataSetId;
@@ -1411,35 +1409,17 @@ contract FilecoinWarmStorageService is
      * @param extraData The encoded extra data from PDPVerifier
      * @return decoded The decoded DataSetCreateData struct
      */
-    function decodeDataSetCreateData(bytes calldata extraData)
-        internal
-        pure
-        returns (DataSetCreateData memory, address currency)
-    {
-        // Both variants decode with the legacy tuple: the #618 variant appends `address currency`
-        // to the head, which moves every offset by one word without changing what they point to.
+    function decodeDataSetCreateData(bytes calldata extraData) internal pure returns (DataSetCreateData memory) {
         (address payer, uint256 clientDataSetId, string[] memory keys, string[] memory values, bytes memory signature) =
             abi.decode(extraData, (address, uint256, string[], string[], bytes));
 
-        // Legacy encodings put the first dynamic field (`keys`) at 0xa0; the variant puts it at 0xc0
-        // and the currency in head word 5.
-        // abi.decode above has checked the head is in bounds. The signature commits to the currency.
-        assembly ("memory-safe") {
-            if iszero(eq(calldataload(add(extraData.offset, 0x40)), 0xa0)) {
-                currency := shr(96, shl(96, calldataload(add(extraData.offset, 0xa0))))
-            }
-        }
-
-        return (
-            DataSetCreateData({
-                payer: payer,
-                clientDataSetId: clientDataSetId,
-                metadataKeys: keys,
-                metadataValues: values,
-                signature: signature
-            }),
-            currency
-        );
+        return DataSetCreateData({
+            payer: payer,
+            clientDataSetId: clientDataSetId,
+            metadataKeys: keys,
+            metadataValues: values,
+            signature: signature
+        });
     }
 
     /**
