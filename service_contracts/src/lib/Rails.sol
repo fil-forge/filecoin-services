@@ -14,6 +14,11 @@ import {
     MAX_CURRENCY_DECIMALS,
     MIN_CURRENCY_DECIMALS
 } from "./CurrencyRegistry.sol";
+import {DATA_SET_INFO_ROOT_SLOT} from "./CurrencyRegistry.sol";
+
+interface IDefaultCurrency {
+    function usdfcTokenAddress() external view returns (address);
+}
 import {
     CDN_LOCKUP_PERIOD,
     DATASET_FEE_PER_EPOCH,
@@ -25,8 +30,7 @@ import {
     LIFECYCLE_RESERVE_TARGET,
     REPLENISH_THRESHOLD,
     SERVICE_COMMISSION_BPS,
-    calculateStorageRate,
-    TOKEN_DECIMALS
+    calculateStorageRate
 } from "./PriceListUSDFC.sol";
 
 event CDNPaymentRailsToppedUp(
@@ -121,10 +125,10 @@ library Rails {
         IERC20 usdfcTokenAddress,
         address payer,
         address payee,
-        address filBeamBeneficiaryAddress,
-        uint256 scale
+        address filBeamBeneficiaryAddress
     ) public returns (uint256 pdpRailId, uint256 cacheMissRailId, uint256 cdnRailId) {
         bool hasCDN = filBeamBeneficiaryAddress != address(0);
+        uint256 scale = currencyScale(dataSetId);
         // Validate payer has sufficient funds and operator approvals to cover the required lockup
         // If CDN is enabled, validation must account for the additional fixed lockup amounts
         validatePayerOperatorApprovalAndFunds(payments, usdfcTokenAddress, payer, hasCDN, scale);
@@ -308,9 +312,9 @@ library Rails {
         uint96 pending,
         uint96 reserveBalance,
         uint256 pdpEndEpoch,
-        bool immediateTermination,
-        uint256 scale
+        bool immediateTermination
     ) public returns (uint96 newReserveBalance) {
+        uint256 scale = currencyScale(dataSetId);
         uint256 newStorageRatePerEpoch = calculateStorageRate(leafCount, scale);
         if (immediateTermination) {
             // No try/catch: immediateTermination implies the payer consented and is solvent.
@@ -328,41 +332,54 @@ library Rails {
         emit RailRateUpdated(dataSetId, pdpRailId, newStorageRatePerEpoch);
     }
 
-    // ---------------------------------------------------------------------
-    // Currency whitelist administration (#618). Called by FWSS behind onlyOwner.
-
-    /// @notice Whitelists a USD stablecoin under the next id.
-    /// @param token The stablecoin; its decimals must be between 6 and 18
-    /// @param defaultToken The deployment's default token (id 0), which cannot be added again
-    function addCurrency(IERC20Metadata token, address defaultToken) public returns (uint8 currencyId) {
-        CurrencyRegistryStorage storage $ = CurrencyRegistry.layout();
-        require(address(token) != defaultToken && $.ids[address(token)] == 0, Errors.CurrencyAlreadyAdded(address(token)));
-        uint8 decimals = token.decimals();
-        require(
-            decimals >= MIN_CURRENCY_DECIMALS && decimals <= MAX_CURRENCY_DECIMALS,
-            Errors.InvalidCurrencyDecimals(address(token), decimals)
-        );
-        uint256 next = $.count + 1;
-        require(next <= type(uint8).max, Errors.TooManyCurrencies());
-        currencyId = uint8(next);
-        $.count = next;
-        $.ids[address(token)] = next;
-        $.currencies[next] = Currency({
-            token: address(token),
-            scale: uint64(10 ** (TOKEN_DECIMALS - decimals)),
-            decimals: decimals,
-            enabled: true
-        });
-        emit CurrencyAdded(currencyId, address(token), decimals);
+    /// @notice Divisor from the 18-decimal price list to a data set's token units.
+    /// @dev Reads `DataSetInfo.currencyShift` (slot 10 of the struct, bits 200-207) from FWSS storage;
+    ///      Rails functions run by DELEGATECALL in FWSS's context. Zero (every pre-#618 data set) is 1.
+    function currencyScale(uint256 dataSetId) internal view returns (uint256 scale) {
+        bytes32 baseSlot = DATA_SET_INFO_ROOT_SLOT;
+        assembly ("memory-safe") {
+            mstore(0, dataSetId)
+            mstore(0x20, baseSlot)
+            let shift := and(shr(200, sload(add(keccak256(0, 0x40), 10))), 0xff) // currency code bits 8-15
+            scale := exp(10, shift)
+        }
     }
 
-    /// @notice Enables or disables new data sets in a whitelisted currency.
-    /// @dev Existing data sets keep paying in their currency either way.
-    function setCurrencyEnabled(address token, bool enabled) public {
+    /// @notice Currency code of an enabled non-default currency: id | (18 - decimals) << 8.
+    /// @dev The code is stored as `DataSetInfo.currency`.
+    function resolveCurrency(address token) public view returns (uint16 code) {
+        CurrencyRegistryStorage storage $ = CurrencyRegistry.layout();
+        uint256 id = $.ids[token];
+        Currency storage c = $.currencies[id];
+        require(id != 0 && c.enabled, Errors.UnsupportedCurrency(token));
+        return uint16(id) | (uint16(MAX_CURRENCY_DECIMALS - c.decimals) << 8);
+    }
+
+    // ---------------------------------------------------------------------
+    // Currency whitelist administration (#618). FWSS forwards its owner-only
+    // `setCurrency(address,bool)` call here unchanged.
+
+    /// @notice Whitelists `token` under the next id, or enables/disables an existing entry.
+    /// @dev The default token (id 0) cannot be added. Decimals must be between 6 and 18.
+    function setCurrency(address token, bool enabled) public {
         CurrencyRegistryStorage storage $ = CurrencyRegistry.layout();
         uint256 currencyId = $.ids[token];
-        require(currencyId != 0, Errors.UnsupportedCurrency(token));
-        $.currencies[currencyId].enabled = enabled;
+        if (currencyId == 0) {
+            require(token != IDefaultCurrency(address(this)).usdfcTokenAddress(), Errors.CurrencyAlreadyAdded(token));
+            uint8 decimals = IERC20Metadata(token).decimals();
+            require(
+                decimals >= MIN_CURRENCY_DECIMALS && decimals <= MAX_CURRENCY_DECIMALS,
+                Errors.InvalidCurrencyDecimals(token, decimals)
+            );
+            currencyId = $.count + 1;
+            require(currencyId <= type(uint8).max, Errors.TooManyCurrencies());
+            $.count = currencyId;
+            $.ids[token] = currencyId;
+            $.currencies[currencyId] = Currency({token: token, decimals: decimals, enabled: enabled});
+            emit CurrencyAdded(uint8(currencyId), token, decimals);
+        } else {
+            $.currencies[currencyId].enabled = enabled;
+        }
         emit CurrencyEnabledSet(uint8(currencyId), token, enabled);
     }
 }

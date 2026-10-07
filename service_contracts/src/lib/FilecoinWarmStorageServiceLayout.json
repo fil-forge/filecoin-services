@@ -266,13 +266,13 @@
             }
           },
           {
-            "label": "currencyId",
+            "label": "currency",
             "slot": "10",
             "offset": 24,
             "type": {
-              "label": "uint8",
+              "label": "uint16",
               "encoding": "inplace",
-              "numberOfBytes": "1"
+              "numberOfBytes": "2"
             }
           }
         ]

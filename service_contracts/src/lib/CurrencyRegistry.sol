@@ -7,6 +7,11 @@ import {Errors} from "../Errors.sol";
 ///      keccak256(abi.encode(uint256(keccak256("fwss.storage.currencies")) - 1)) & ~bytes32(uint256(0xff))
 bytes32 constant CURRENCY_REGISTRY_SLOT = 0xce14d13e508ebe613422ae6621b56280fb248a730a4c1776e0b3bd40cac71400;
 
+/// @dev Root slot of FWSS's `dataSetInfo` mapping. Mirrors the generated
+///      `FilecoinWarmStorageServiceLayout.DATA_SET_INFO_SLOT` (which Rails cannot import: the layout
+///      generator compiles FWSS, which links Rails). Pinned by MultiCurrencyTest.
+bytes32 constant DATA_SET_INFO_ROOT_SLOT = bytes32(uint256(7));
+
 /// @dev Price-list constants are written at 18 decimals; a token with `d` decimals is charged
 ///      `amount18 / 10**(18 - d)`. Six decimals keeps the per-epoch dataset fee at one unit or more.
 uint8 constant MIN_CURRENCY_DECIMALS = 6;
@@ -19,7 +24,6 @@ event CurrencyEnabledSet(uint8 indexed currencyId, address indexed token, bool e
 /// @notice A whitelisted USD stablecoin. Packed into one slot.
 struct Currency {
     address token;
-    uint64 scale; // 10 ** (18 - decimals)
     uint8 decimals;
     bool enabled; // false: no new data sets; existing data sets keep paying in it
 }
@@ -39,22 +43,5 @@ library CurrencyRegistry {
         assembly ("memory-safe") {
             $.slot := CURRENCY_REGISTRY_SLOT
         }
-    }
-
-    /// @notice Divisor applied to the 18-decimal price list for a data set's currency.
-    function scaleOf(uint8 currencyId) internal view returns (uint256) {
-        if (currencyId == 0) return 1;
-        return layout().currencies[currencyId].scale;
-    }
-
-    /// @notice Resolves a client-requested token to its id and scale.
-    /// @dev address(0) and the default token resolve to id 0. Others must be whitelisted and enabled.
-    function resolve(address token, address defaultToken) internal view returns (uint8 currencyId, uint256 scale) {
-        if (token == address(0) || token == defaultToken) return (0, 1);
-        CurrencyRegistryStorage storage $ = layout();
-        currencyId = uint8($.ids[token]);
-        Currency storage c = $.currencies[currencyId];
-        require(currencyId != 0 && c.enabled, Errors.UnsupportedCurrency(token));
-        return (currencyId, c.scale);
     }
 }

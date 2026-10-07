@@ -98,9 +98,10 @@ library SignatureVerificationLib {
         if (currency == address(0)) {
             return keccak256(abi.encode(CREATE_DATA_SET_TYPEHASH, clientDataSetId, payee, metadataHash));
         }
-        return keccak256(
-            abi.encode(CREATE_DATA_SET_WITH_CURRENCY_TYPEHASH, clientDataSetId, payee, currency, metadataHash)
-        );
+        return
+            keccak256(
+                abi.encode(CREATE_DATA_SET_WITH_CURRENCY_TYPEHASH, clientDataSetId, payee, currency, metadataHash)
+            );
     }
 
     function hashAllCids(Cids.Cid[] calldata pieceDataArray) internal pure returns (bytes32 cidHashesHash) {

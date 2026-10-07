@@ -12,7 +12,12 @@ import {FilecoinWarmStorageService} from "../src/FilecoinWarmStorageService.sol"
 import {Errors} from "../src/Errors.sol";
 import {PriceList} from "../src/lib/PriceList.sol";
 import {DATA_SET_INFO_SLOT} from "../src/lib/FilecoinWarmStorageServiceLayout.sol";
-import {CURRENCY_REGISTRY_SLOT, CurrencyAdded, CurrencyEnabledSet} from "../src/lib/CurrencyRegistry.sol";
+import {
+    CURRENCY_REGISTRY_SLOT,
+    DATA_SET_INFO_ROOT_SLOT,
+    CurrencyAdded,
+    CurrencyEnabledSet
+} from "../src/lib/CurrencyRegistry.sol";
 import {
     calculateStorageRate,
     TIB_IN_BYTES,
@@ -58,6 +63,7 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
     uint256 constant SIX_ADD_BASE_FEE = 8_000; // $0.008
     uint256 constant SIX_ADD_PER_PIECE_FEE = 3_000; // $0.003
     uint256 constant SIX_REMOVALS_FEE = 7_000; // $0.007
+    uint256 constant SIX_TERMINATE_FEE = 6_000; // $0.006
     uint256 constant SIX_DATASET_FEE_PER_EPOCH = 1; // 120_000 / 86_400 truncated
     uint256 constant SIX_STORAGE_PER_TIB_MONTH = 2_500_000; // $2.50
     uint256 constant SIX_REQUIRED_LOCKUP = 620_000; // dataset fee month + reserve
@@ -190,11 +196,11 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
     function testAddCurrency_AssignsSequentialIdsAndEmits() public withTokens {
         vm.expectEmit(true, true, false, true, address(pdpServiceWithPayments));
         emit CurrencyAdded(1, address(axl), 6);
-        pdpServiceWithPayments.addCurrency(axl);
+        pdpServiceWithPayments.setCurrency(address(axl), true);
 
         vm.expectEmit(true, true, false, true, address(pdpServiceWithPayments));
         emit CurrencyAdded(2, address(usd18), 18);
-        pdpServiceWithPayments.addCurrency(usd18);
+        pdpServiceWithPayments.setCurrency(address(usd18), true);
 
         assertEq(viewContract.getCurrencyCount(), 2);
         assertEq(viewContract.getCurrencyId(address(axl)), 1);
@@ -213,50 +219,50 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
     function testAddCurrency_OnlyOwner() public withTokens {
         vm.prank(client);
         vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, client));
-        pdpServiceWithPayments.addCurrency(axl);
+        pdpServiceWithPayments.setCurrency(address(axl), true);
 
-        pdpServiceWithPayments.addCurrency(axl);
+        pdpServiceWithPayments.setCurrency(address(axl), true);
         vm.prank(client);
         vm.expectRevert(abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, client));
-        pdpServiceWithPayments.setCurrencyEnabled(address(axl), false);
+        pdpServiceWithPayments.setCurrency(address(axl), false);
     }
 
-    function testAddCurrency_RejectsDuplicatesDefaultAndBadDecimals() public withTokens {
-        pdpServiceWithPayments.addCurrency(axl);
-        vm.expectRevert(abi.encodeWithSelector(Errors.CurrencyAlreadyAdded.selector, address(axl)));
-        pdpServiceWithPayments.addCurrency(axl);
-
+    function testAddCurrency_RejectsDefaultAndBadDecimals() public withTokens {
         vm.expectRevert(abi.encodeWithSelector(Errors.CurrencyAlreadyAdded.selector, address(mockUSDFC)));
-        pdpServiceWithPayments.addCurrency(IERC20Metadata(address(mockUSDFC)));
+        pdpServiceWithPayments.setCurrency(address(mockUSDFC), true);
 
         MockStablecoin five = new MockStablecoin("FIVE", 5);
         vm.expectRevert(abi.encodeWithSelector(Errors.InvalidCurrencyDecimals.selector, address(five), uint8(5)));
-        pdpServiceWithPayments.addCurrency(five);
+        pdpServiceWithPayments.setCurrency(address(five), true);
 
         MockStablecoin nineteen = new MockStablecoin("NINETEEN", 19);
-        vm.expectRevert(
-            abi.encodeWithSelector(Errors.InvalidCurrencyDecimals.selector, address(nineteen), uint8(19))
-        );
-        pdpServiceWithPayments.addCurrency(nineteen);
+        vm.expectRevert(abi.encodeWithSelector(Errors.InvalidCurrencyDecimals.selector, address(nineteen), uint8(19)));
+        pdpServiceWithPayments.setCurrency(address(nineteen), true);
     }
 
-    function testSetCurrencyEnabled_EmitsAndRejectsUnknown() public withTokens {
-        pdpServiceWithPayments.addCurrency(axl);
+    function testSetCurrency_TogglesEnabledAndCanAddDisabled() public withTokens {
+        pdpServiceWithPayments.setCurrency(address(axl), true);
         vm.expectEmit(true, true, false, true, address(pdpServiceWithPayments));
         emit CurrencyEnabledSet(1, address(axl), false);
-        pdpServiceWithPayments.setCurrencyEnabled(address(axl), false);
+        pdpServiceWithPayments.setCurrency(address(axl), false);
         (,, bool enabled) = viewContract.getCurrency(1);
         assertFalse(enabled);
+        assertEq(viewContract.getCurrencyCount(), 1, "toggling does not add an entry");
 
-        vm.expectRevert(abi.encodeWithSelector(Errors.UnsupportedCurrency.selector, address(usd18)));
-        pdpServiceWithPayments.setCurrencyEnabled(address(usd18), true);
+        // An unknown token is added under the next id, here disabled from the start
+        vm.expectEmit(true, true, false, true, address(pdpServiceWithPayments));
+        emit CurrencyAdded(2, address(usd18), 18);
+        pdpServiceWithPayments.setCurrency(address(usd18), false);
+        (address token,, bool enabled2) = viewContract.getCurrency(2);
+        assertEq(token, address(usd18));
+        assertFalse(enabled2);
     }
 
     // ---------------------------------------------------------------------
     // backwards compatibility
 
     function testLegacyExtraDataStillUsesDefaultToken() public withTokens {
-        pdpServiceWithPayments.addCurrency(axl);
+        pdpServiceWithPayments.setCurrency(address(axl), true);
         _fund(client, mockUSDFC, 100e18);
         makeSignaturePass(client);
         vm.prank(serviceProvider);
@@ -292,8 +298,8 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
     // the currency is client-signed
 
     function testV2SignatureBindsCurrency() public withTokens {
-        pdpServiceWithPayments.addCurrency(axl);
-        pdpServiceWithPayments.addCurrency(usd18);
+        pdpServiceWithPayments.setCurrency(address(axl), true);
+        pdpServiceWithPayments.setCurrency(address(usd18), true);
         _fund(signingClient, axl, 100e6);
         _fund(signingClient, usd18, 100e18);
 
@@ -325,7 +331,7 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
     }
 
     function testSessionKeyWithCreateDataSetPermissionCanSignV2() public withTokens {
-        pdpServiceWithPayments.addCurrency(axl);
+        pdpServiceWithPayments.setCurrency(address(axl), true);
         _fund(client, axl, 100e6);
         bytes32[] memory permissions = new bytes32[](1);
         permissions[0] = CREATE_DATA_SET_TYPEHASH_V1;
@@ -354,11 +360,11 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
     }
 
     function testDisabledCurrencyBlocksNewDataSetsOnly() public withTokens {
-        pdpServiceWithPayments.addCurrency(axl);
+        pdpServiceWithPayments.setCurrency(address(axl), true);
         _fund(client, axl, 1000e6);
         uint256 existing = _createV2(address(axl), false);
 
-        pdpServiceWithPayments.setCurrencyEnabled(address(axl), false);
+        pdpServiceWithPayments.setCurrency(address(axl), false);
         makeSignaturePass(client);
         vm.prank(serviceProvider);
         vm.expectRevert(abi.encodeWithSelector(Errors.UnsupportedCurrency.selector, address(axl)));
@@ -372,7 +378,7 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
         assertEq(token, address(axl));
         assertEq(_reserve(existing), SIX_RESERVE - SIX_CREATE_FEE - SIX_ADD_BASE_FEE - 2 * SIX_ADD_PER_PIECE_FEE);
 
-        pdpServiceWithPayments.setCurrencyEnabled(address(axl), true);
+        pdpServiceWithPayments.setCurrency(address(axl), true);
         _createV2(address(axl), false);
     }
 
@@ -380,7 +386,7 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
     // amounts scale to the token's decimals
 
     function testSixDecimalDataSetCreationAmounts() public withTokens {
-        pdpServiceWithPayments.addCurrency(axl);
+        pdpServiceWithPayments.setCurrency(address(axl), true);
         _fund(client, axl, 100e6);
         uint256 dataSetId = _createV2(address(axl), false);
 
@@ -395,7 +401,7 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
     }
 
     function testSixDecimalFundsCheckUsesScaledRequirement() public withTokens {
-        pdpServiceWithPayments.addCurrency(axl);
+        pdpServiceWithPayments.setCurrency(address(axl), true);
         _fund(client, axl, SIX_REQUIRED_LOCKUP - 1);
         makeSignaturePass(client);
         vm.prank(serviceProvider);
@@ -416,7 +422,7 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
     }
 
     function testSixDecimalCDNLockups() public withTokens {
-        pdpServiceWithPayments.addCurrency(axl);
+        pdpServiceWithPayments.setCurrency(address(axl), true);
         _fund(client, axl, 100e6);
         uint256 dataSetId = _createV2(address(axl), true);
         FilecoinWarmStorageService.DataSetInfoView memory info = viewContract.getDataSet(dataSetId);
@@ -429,7 +435,7 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
     }
 
     function testSixDecimalOperationFees() public withTokens {
-        pdpServiceWithPayments.addCurrency(axl);
+        pdpServiceWithPayments.setCurrency(address(axl), true);
         _fund(client, axl, 100e6);
         uint256 dataSetId = _createV2(address(axl), false);
 
@@ -446,8 +452,27 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
         assertEq(_pending(dataSetId), SIX_REMOVALS_FEE);
     }
 
+    function testSixDecimalTerminateFeePaidInToken() public withTokens {
+        pdpServiceWithPayments.setCurrency(address(axl), true);
+        _fund(client, axl, 100e6);
+        uint256 dataSetId = _createV2(address(axl), false);
+        _addPieces(dataSetId, 1);
+
+        (, uint256 spBefore,,) = payments.getAccountInfoIfSettled(axl, serviceProvider);
+        makeSignaturePass(client);
+        vm.prank(serviceProvider);
+        pdpServiceWithPayments.terminateService(dataSetId, abi.encode(FAKE_SIGNATURE));
+        (, uint256 spAfter,,) = payments.getAccountInfoIfSettled(axl, serviceProvider);
+
+        uint256 networkFee =
+            (SIX_TERMINATE_FEE * payments.NETWORK_FEE_NUMERATOR() + payments.NETWORK_FEE_DENOMINATOR() - 1)
+                / payments.NETWORK_FEE_DENOMINATOR();
+        assertEq(spAfter - spBefore, SIX_TERMINATE_FEE - networkFee, "SP receives the 6-decimal terminate fee");
+        assertEq(_pdpRail(dataSetId).lockupFixed, 0);
+    }
+
     function testSixDecimalStorageRateMatchesNativeSixDecimalPriceList() public withTokens {
-        pdpServiceWithPayments.addCurrency(axl);
+        pdpServiceWithPayments.setCurrency(address(axl), true);
         _fund(client, axl, 1000e6);
         uint256 dataSetId = _createV2(address(axl), false);
 
@@ -465,7 +490,7 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
     }
 
     function testSecondEighteenDecimalCurrencyChargesSameAsUSDFC() public withTokens {
-        pdpServiceWithPayments.addCurrency(usd18);
+        pdpServiceWithPayments.setCurrency(address(usd18), true);
         _fund(client, usd18, 1000e18);
         _fund(client, mockUSDFC, 900e18);
 
@@ -487,7 +512,7 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
     // views
 
     function testPriceListForCurrencyIsScaled() public withTokens {
-        pdpServiceWithPayments.addCurrency(axl);
+        pdpServiceWithPayments.setCurrency(address(axl), true);
         PriceList memory list = viewContract.getPriceListForCurrency(address(axl));
         assertEq(address(list.token), address(axl));
         assertEq(list.rates.storagePerTibPerMonth, SIX_STORAGE_PER_TIB_MONTH);
@@ -513,8 +538,9 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
             CURRENCY_REGISTRY_SLOT,
             keccak256(abi.encode(uint256(keccak256("fwss.storage.currencies")) - 1)) & ~bytes32(uint256(0xff))
         );
-        pdpServiceWithPayments.addCurrency(usd18);
-        pdpServiceWithPayments.addCurrency(axl);
+        assertEq(DATA_SET_INFO_ROOT_SLOT, DATA_SET_INFO_SLOT, "Rails' copy of the dataSetInfo root slot");
+        pdpServiceWithPayments.setCurrency(address(usd18), true);
+        pdpServiceWithPayments.setCurrency(address(axl), true);
         _fund(client, axl, 100e6);
         uint256 dataSetId = _createV2(address(axl), false);
 
@@ -522,6 +548,7 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
             address(pdpServiceWithPayments), bytes32(uint256(keccak256(abi.encode(dataSetId, DATA_SET_INFO_SLOT))) + 10)
         );
         assertEq(uint8(uint256(word10) >> 192), 2, "currency id in DataSetInfo bits 192-199");
+        assertEq(uint8(uint256(word10) >> 200), 12, "decimal shift (18 - 6) in DataSetInfo bits 200-207");
         assertEq(uint96(uint256(word10)), SIX_CREATE_FEE, "pending unchanged at bits 0-95");
         assertEq(uint256(vm.load(address(pdpServiceWithPayments), CURRENCY_REGISTRY_SLOT)), 2, "currency count");
     }

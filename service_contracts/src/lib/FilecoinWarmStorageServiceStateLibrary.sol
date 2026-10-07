@@ -629,11 +629,10 @@ library FilecoinWarmStorageServiceStateLibrary {
         if (currencyId == 0) {
             return (address(service.usdfcTokenAddress()), 18, true);
         }
-        uint256 word =
-            uint256(service.extsload(keccak256(abi.encode(currencyId, uint256(CURRENCY_REGISTRY_SLOT) + 1))));
+        uint256 word = uint256(service.extsload(keccak256(abi.encode(currencyId, uint256(CURRENCY_REGISTRY_SLOT) + 1))));
         token = address(uint160(word));
-        decimals = uint8(word >> 224);
-        enabled = uint8(word >> 232) != 0;
+        decimals = uint8(word >> 160);
+        enabled = uint8(word >> 168) != 0;
     }
 
     /**
