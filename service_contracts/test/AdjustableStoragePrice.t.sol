@@ -4,12 +4,13 @@ pragma solidity ^0.8.20;
 import {Cids} from "@pdp/Cids.sol";
 import {FilecoinWarmStorageServiceTest, TestDataSetAuthorizer} from "./FilecoinWarmStorageService.t.sol";
 import {Errors} from "../src/Errors.sol";
+import {FilecoinWarmStorageService} from "../src/FilecoinWarmStorageService.sol";
+import {FilecoinPayV1} from "@fws-payments/FilecoinPayV1.sol";
 import {
-    DATA_SET_AUTHORIZER_ROOT_SLOT,
     FWSS_DATA_SET_PRICING_STORAGE_SLOT,
-    DataSetStoragePriceSet
+    DataSetStoragePriceSet,
+    StoragePriceOffersCancelled
 } from "../src/lib/PaymentTermsStorage.sol";
-import {DATA_SET_AUTHORIZER_SLOT} from "../src/lib/FilecoinWarmStorageServiceLayout.sol";
 import {
     DATASET_FEE_PER_EPOCH,
     EPOCHS_PER_MONTH,
@@ -533,7 +534,9 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         assertEq(stored, newPrice);
     }
 
-    function test_update_usesDataSetAuthorizer() public payerReady {
+    /// UpdateStoragePrice is a new spending operation, so grants issued to a data set's authorizer (#536) do
+    /// not extend to it: only the payer or a payer session key with the UpdateStoragePrice permission signs.
+    function test_update_ignoresDataSetAuthorizer() public payerReady {
         uint256 dataSetId = _createWithPrice(0);
         TestDataSetAuthorizer authorizer = new TestDataSetAuthorizer(sessionKeyRegistry);
         (address delegate, uint256 delegateKey) = makeAddrAndKey("fil1276-delegate");
@@ -542,17 +545,105 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         pdpServiceWithPayments.setDataSetAuthorizer(dataSetId, address(authorizer));
 
         uint256 newPrice = 2 * STORAGE_PRICE_PER_TIB_PER_MONTH;
-        // With an authorizer attached, the authorizer decides; the payer's own key is not consulted.
-        bytes memory payerSig = _signUpdate(payerKey, dataSetId, 0, newPrice);
-        vm.expectPartialRevert(Errors.Unauthorized.selector);
-        vm.prank(sp1);
-        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, block.number, payerSig);
-
         bytes memory delegateSig = _signUpdate(delegateKey, dataSetId, 0, newPrice);
+        vm.expectRevert(abi.encodeWithSelector(Errors.InvalidSignature.selector, payer, delegate));
         vm.prank(sp1);
         pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, block.number, delegateSig);
+
+        bytes memory payerSig = _signUpdate(payerKey, dataSetId, 0, newPrice);
+        vm.prank(sp1);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, block.number, payerSig);
         (uint256 stored,) = viewContract.getDataSetStoragePrice(dataSetId);
         assertEq(stored, newPrice);
+    }
+
+    // ------------------------------------------------------------------
+    // Cancelling outstanding offers
+    // ------------------------------------------------------------------
+
+    function test_cancelOffers_payerBumpsNonce() public payerReady {
+        uint256 dataSetId = _createWithPrice(0);
+        uint256 newPrice = 2 * STORAGE_PRICE_PER_TIB_PER_MONTH;
+        bytes memory sig = _signUpdateUntil(payerKey, dataSetId, 0, newPrice, block.number + 1000);
+
+        vm.expectEmit(true, false, false, true, address(pdpServiceWithPayments));
+        emit StoragePriceOffersCancelled(dataSetId, 1);
+        vm.prank(payer);
+        pdpServiceWithPayments.cancelStoragePriceOffers(dataSetId);
+        (, uint256 nonce) = viewContract.getDataSetStoragePrice(dataSetId);
+        assertEq(nonce, 1);
+
+        vm.expectRevert(abi.encodeWithSelector(Errors.InvalidStoragePriceNonce.selector, dataSetId, 1, 0));
+        vm.prank(sp1);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, block.number + 1000, sig);
+
+        // A fresh offer at the new nonce works
+        bytes memory fresh = _signUpdate(payerKey, dataSetId, 1, newPrice);
+        vm.prank(sp1);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 1, block.number, fresh);
+        (uint256 stored, uint256 nonce2) = viewContract.getDataSetStoragePrice(dataSetId);
+        assertEq(stored, newPrice);
+        assertEq(nonce2, 2);
+    }
+
+    function test_cancelOffers_payerSessionKey() public payerReady {
+        uint256 dataSetId = _createWithPrice(0);
+        bytes32[] memory permission = new bytes32[](1);
+        permission[0] = UPDATE_STORAGE_PRICE_TYPEHASH;
+        vm.prank(payer);
+        sessionKeyRegistry.login(sessionSigner, block.timestamp + 1 days, permission, "fil1276");
+        vm.prank(sessionSigner);
+        pdpServiceWithPayments.cancelStoragePriceOffers(dataSetId);
+        (, uint256 nonce) = viewContract.getDataSetStoragePrice(dataSetId);
+        assertEq(nonce, 1);
+    }
+
+    function test_cancelOffers_othersRejected() public payerReady {
+        uint256 dataSetId = _createWithPrice(0);
+        vm.expectRevert(abi.encodeWithSelector(Errors.CallerNotPayer.selector, dataSetId, payer, sp1));
+        vm.prank(sp1);
+        pdpServiceWithPayments.cancelStoragePriceOffers(dataSetId);
+
+        // A session key without the UpdateStoragePrice permission cannot cancel either
+        bytes32[] memory permission = new bytes32[](1);
+        permission[0] = CREATE_DATA_SET_TYPEHASH_;
+        vm.prank(payer);
+        sessionKeyRegistry.login(sessionSigner, block.timestamp + 1 days, permission, "fil1276");
+        vm.expectRevert(abi.encodeWithSelector(Errors.CallerNotPayer.selector, dataSetId, payer, sessionSigner));
+        vm.prank(sessionSigner);
+        pdpServiceWithPayments.cancelStoragePriceOffers(dataSetId);
+
+        vm.expectRevert(abi.encodeWithSelector(Errors.InvalidDataSetId.selector, 999));
+        vm.prank(payer);
+        pdpServiceWithPayments.cancelStoragePriceOffers(999);
+    }
+
+    // ------------------------------------------------------------------
+    // Deletion
+    // ------------------------------------------------------------------
+
+    function test_deletion_clearsPaymentTerms() public payerReady {
+        uint256 price = 2 * STORAGE_PRICE_PER_TIB_PER_MONTH;
+        uint256 dataSetId = _createWithPrice(price);
+        bytes memory sig = _signUpdate(payerKey, dataSetId, 0, 3 * price);
+        vm.prank(sp1);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, 3 * price, 0, block.number, sig);
+        bytes32 slot = keccak256(abi.encode(dataSetId, FWSS_DATA_SET_PRICING_STORAGE_SLOT));
+        assertTrue(pdpServiceWithPayments.extsload(slot) != bytes32(0));
+
+        vm.prank(payer);
+        pdpServiceWithPayments.terminateService(dataSetId);
+        FilecoinWarmStorageService.DataSetInfoView memory info = viewContract.getDataSet(dataSetId);
+        vm.roll(info.pdpEndEpoch + 1);
+        FilecoinPayV1.RailView memory rail = payments.getRail(info.pdpRailId);
+        payments.settleRail(info.pdpRailId, rail.endEpoch);
+        vm.prank(sp1);
+        mockPDPVerifier.deleteDataSet(pdpServiceWithPayments, dataSetId, "");
+
+        assertEq(pdpServiceWithPayments.extsload(slot), bytes32(0), "payment terms cleared");
+        (uint256 stored, uint256 nonce) = viewContract.getDataSetStoragePrice(dataSetId);
+        assertEq(stored, 0);
+        assertEq(nonce, 0);
     }
 
     // ------------------------------------------------------------------
@@ -579,11 +670,5 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         word = uint256(pdpServiceWithPayments.extsload(slot));
         assertEq(uint128(word), 3 * price);
         assertEq(uint64(word >> 128), 1, "stored per-data-set nonce");
-    }
-
-    /// Rails.updateStoragePrice reads the data set's authorizer from FWSS storage itself (it runs by
-    /// DELEGATECALL in the proxy); its copy of the root slot must match the generated layout.
-    function test_authorizerRootSlot_matchesLayout() public pure {
-        assertEq(DATA_SET_AUTHORIZER_ROOT_SLOT, DATA_SET_AUTHORIZER_SLOT);
     }
 }

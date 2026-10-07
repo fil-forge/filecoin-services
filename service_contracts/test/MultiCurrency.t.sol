@@ -27,7 +27,12 @@ import {
     TIB_IN_BYTES,
     EPOCHS_PER_MONTH,
     LIFECYCLE_RESERVE_TARGET,
-    CREATE_DATA_SET_FEE
+    CREATE_DATA_SET_FEE,
+    ADD_PIECES_BASE_FEE,
+    ADD_PIECES_PER_PIECE_FEE,
+    SCHEDULE_PIECE_REMOVALS_FEE,
+    TERMINATE_FEE,
+    REPLENISH_THRESHOLD
 } from "../src/lib/PriceListUSDFC.sol";
 import {console} from "forge-std/Test.sol";
 
@@ -559,7 +564,8 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
         assertEq(_pdpRail(dataSetId).lockupFixed, 0);
     }
 
-    /// Each per-epoch term is computed at 18 decimals as on main, then rounded up to whole token units.
+    /// The per-epoch rate is computed at 18 decimals as on main (size term plus dataset fee), then the sum is
+    /// rounded up once to whole token units.
     function testSixDecimalStorageRateRoundsUp() public withTokens {
         pdpServiceWithPayments.setCurrency(address(axl), true);
         _fund(client, axl, 1000e6);
@@ -573,10 +579,10 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
 
         uint256 rawBytes = Cids.leafCountToRawSize(leafCount);
         uint256 sizeTerm18 = (rawBytes * STORAGE_PRICE_PER_TIB_PER_MONTH) / (TIB_IN_BYTES * EPOCHS_PER_MONTH);
-        uint256 expected = _ceil(sizeTerm18, 1e12) + _ceil(DATASET_FEE_PER_EPOCH, 1e12);
-        assertGt(sizeTerm18 % 1e12, 0, "size term must not be a whole number of units for this check");
+        uint256 expected = _ceil(sizeTerm18 + DATASET_FEE_PER_EPOCH, 1e12);
+        assertGt((sizeTerm18 + DATASET_FEE_PER_EPOCH) % 1e12, 0, "sum must not be a whole number of units");
         assertEq(_pdpRail(dataSetId).paymentRate, expected);
-        assertEq(expected, sizeTerm18 / 1e12 + 1 + SIX_DATASET_FEE_PER_EPOCH);
+        assertLt(expected, _ceil(sizeTerm18, 1e12) + _ceil(DATASET_FEE_PER_EPOCH, 1e12), "one rounding, not two");
     }
 
     function testSecondEighteenDecimalCurrencyChargesSameAsUSDFC() public withTokens {
@@ -606,11 +612,22 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
         PriceList memory list = viewContract.getPriceListForCurrency(address(axl));
         assertEq(address(list.token), address(axl));
         assertEq(list.rates.storagePerTibPerMonth, SIX_STORAGE_PER_TIB_MONTH);
-        assertEq(list.rates.datasetFeePerMonth, 120_000);
+        // The dataset fee as charged: ceil(1.389) = 2 units per epoch, the minimum rate of a non-empty data set
+        assertEq(list.rates.datasetFeePerMonth, SIX_DATASET_FEE_PER_EPOCH * EPOCHS_PER_MONTH);
         assertEq(list.fees.createDataSetFee, SIX_CREATE_FEE);
+        assertEq(list.fees.addPiecesBaseFee, SIX_ADD_BASE_FEE);
         assertEq(list.fees.addPiecesPerPieceFee, SIX_ADD_PER_PIECE_FEE);
+        assertEq(list.fees.schedulePieceRemovalsFee, SIX_REMOVALS_FEE);
+        assertEq(list.fees.terminateFee, SIX_TERMINATE_FEE);
         assertEq(list.lockups.lifecycleReserveTarget, SIX_RESERVE);
+        assertEq(list.lockups.replenishThreshold, 25_000);
         assertEq(list.lockups.defaultLockupPeriod, EPOCHS_PER_MONTH);
+        // CDN is not available outside the default token
+        assertEq(list.rates.cdnEgressPerTib, 0);
+        assertEq(list.rates.cacheMissEgressPerTib, 0);
+        assertEq(list.lockups.cdnLockupAmount, 0);
+        assertEq(list.lockups.cacheMissLockupAmount, 0);
+        assertEq(list.lockups.cdnLockupPeriod, 0);
 
         PriceList memory def = viewContract.getPriceListForCurrency(address(mockUSDFC));
         PriceList memory legacy = viewContract.getPriceList();
@@ -648,10 +665,12 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
         );
     }
 
-    /// @dev Rate of a 6-decimal data set at an 18-decimal USD price: each 18-decimal term rounded up.
+    /// @dev Rate of a 6-decimal data set at an 18-decimal USD price: the 18-decimal rate rounded up once.
     function _sixDecimalRate(uint256 leafCount, uint256 price) internal pure returns (uint256) {
-        return _ceil((Cids.leafCountToRawSize(leafCount) * price) / (TIB_IN_BYTES * EPOCHS_PER_MONTH), 1e12)
-            + SIX_DATASET_FEE_PER_EPOCH;
+        return _ceil(
+            (Cids.leafCountToRawSize(leafCount) * price) / (TIB_IN_BYTES * EPOCHS_PER_MONTH) + DATASET_FEE_PER_EPOCH,
+            1e12
+        );
     }
 
     function _grow(uint256 dataSetId) internal returns (uint256 leafCount) {
@@ -859,8 +878,8 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
     // ---------------------------------------------------------------------
     // rounding
 
-    /// A small 6-decimal data set pays at least one unit for the size term and two for the dataset fee.
-    function testSixDecimalSmallDataSetRoundsUpEachTerm() public withTokens {
+    /// A small 6-decimal data set pays the 18-decimal rate rounded up once: 2 units, not 1 + 2.
+    function testSixDecimalSmallDataSetRoundsUpOnce() public withTokens {
         pdpServiceWithPayments.setCurrency(address(axl), true);
         _fund(client, axl, 100e6);
         uint256 dataSetId = _createV2(address(axl), false);
@@ -869,8 +888,77 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
         uint256 sizeTerm18 =
             (Cids.leafCountToRawSize(leafCount) * STORAGE_PRICE_PER_TIB_PER_MONTH) / (TIB_IN_BYTES * EPOCHS_PER_MONTH);
         assertGt(sizeTerm18, 0);
-        assertLt(sizeTerm18, 1e12);
-        assertEq(_pdpRail(dataSetId).paymentRate, 1 + SIX_DATASET_FEE_PER_EPOCH);
+        assertLt(sizeTerm18 + DATASET_FEE_PER_EPOCH, 2e12);
+        assertEq(_pdpRail(dataSetId).paymentRate, 2);
+    }
+
+    /// One-time fees and lockups are whole multiples of 10**12, so converting each fee once and converting a
+    /// pending sum once give the same token amount for every supported decimals value (6 to 18).
+    function testOneTimeAmountsAreExactAtSixDecimals() public pure {
+        uint256[7] memory amounts = [
+            CREATE_DATA_SET_FEE,
+            ADD_PIECES_BASE_FEE,
+            ADD_PIECES_PER_PIECE_FEE,
+            SCHEDULE_PIECE_REMOVALS_FEE,
+            TERMINATE_FEE,
+            LIFECYCLE_RESERVE_TARGET,
+            REPLENISH_THRESHOLD
+        ];
+        for (uint256 i = 0; i < amounts.length; i++) {
+            assertEq(amounts[i] % 1e12, 0);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // upgrade
+
+    /// A data set created before the upgrade keeps its storage and charges exactly as main does afterwards, and
+    /// the new variants work after the upgrade. Main's implementation cannot be deployed in this harness (it
+    /// links its own Rails and SignatureVerificationLib); a legacy create writes exactly main's state (no
+    /// namespaced slot, pinned below), so the pre-upgrade data set stands in for one created on main.
+    function testUpgradeKeepsExistingDataSetsAndEnablesVariants() public withTokens {
+        _fund(client, mockUSDFC, 500e18);
+        makeSignaturePass(client);
+        vm.prank(serviceProvider);
+        uint256 old = mockPDPVerifier.createDataSet(pdpServiceWithPayments, _extraDataV1(client, 90, FAKE_SIGNATURE));
+        _grow(old);
+        bytes32 infoSlot = keccak256(abi.encode(old, DATA_SET_INFO_SLOT));
+        bytes32[] memory before = pdpServiceWithPayments.extsloadStruct(infoSlot, 11);
+        assertEq(
+            pdpServiceWithPayments.extsload(keccak256(abi.encode(old, FWSS_DATA_SET_PRICING_STORAGE_SLOT))),
+            bytes32(0),
+            "legacy data set writes no namespaced state"
+        );
+        uint256 rateBefore = _pdpRail(old).paymentRate;
+        assertEq(rateBefore, calculateStorageRate(mockPDPVerifier.getDataSetLeafCount(old)), "main's rate");
+
+        FilecoinWarmStorageService next = new FilecoinWarmStorageService(
+            address(mockPDPVerifier),
+            address(payments),
+            mockUSDFC,
+            filBeamBeneficiary,
+            serviceProviderRegistry,
+            sessionKeyRegistry,
+            5
+        );
+        pdpServiceWithPayments.announceUpgradePlan(address(next), 10);
+        vm.roll(block.number + 10);
+        pdpServiceWithPayments.upgradeToAndCall(
+            address(next), abi.encodeWithSelector(FilecoinWarmStorageService.migrate.selector, address(viewContract))
+        );
+
+        bytes32[] memory afterUpgrade = pdpServiceWithPayments.extsloadStruct(infoSlot, 11);
+        assertEq(keccak256(abi.encode(afterUpgrade)), keccak256(abi.encode(before)), "DataSetInfo untouched");
+        _addPieces(old, 1);
+        assertEq(_pdpRail(old).paymentRate, calculateStorageRate(mockPDPVerifier.getDataSetLeafCount(old)));
+
+        pdpServiceWithPayments.setCurrency(address(axl), true);
+        _fund(client, axl, 100e6);
+        uint256 c = _createV2(address(axl), false);
+        uint256 e = _createV2Priced(address(mockUSDFC), 5e18);
+        assertEq(address(_pdpRail(c).token), address(axl));
+        (uint256 stored,) = viewContract.getDataSetStoragePrice(e);
+        assertEq(stored, 5e18);
     }
 
     // ---------------------------------------------------------------------
