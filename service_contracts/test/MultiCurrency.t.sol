@@ -53,9 +53,10 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
         "CreateDataSet(uint256 clientDataSetId,address payee,MetadataEntry[] metadata)"
         "MetadataEntry(string key,string value)"
     );
-    bytes32 constant CREATE_DATA_SET_WITH_CURRENCY_TYPEHASH = keccak256(
-        "CreateDataSetWithCurrency(uint256 clientDataSetId,address payee,address currency,MetadataEntry[] metadata)"
-        "MetadataEntry(string key,string value)"
+    // One extraData variant and one EIP-712 type carry both #618 (token) and #619 (storage price)
+    bytes32 constant CREATE_DATA_SET_WITH_PAYMENT_TYPEHASH = keccak256(
+        "CreateDataSetWithPayment(uint256 clientDataSetId,address payee,MetadataEntry[] metadata,address token,"
+        "uint256 storagePricePerTibPerMonth)" "MetadataEntry(string key,string value)"
     );
     bytes32 constant METADATA_ENTRY_TYPEHASH = keccak256("MetadataEntry(string key,string value)");
 
@@ -119,15 +120,27 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
         }
     }
 
-    /// @dev The #618 variant: the legacy tuple with `address currency` appended. The first dynamic
-    ///      field (`keys`) then sits at offset 0xc0 instead of 0xa0.
+    /// @dev The shared #618/#619 variant: the legacy tuple with `address token` and
+    ///      `uint256 storagePricePerTibPerMonth` appended. The first dynamic field (`keys`) then sits at
+    ///      offset 0xe0 instead of 0xa0. Price 0 means the posted price.
     function _extraDataV2(address payer, uint256 clientDataSetId, bool withCDN, bytes memory sig, address currency)
         internal
         pure
         returns (bytes memory)
     {
+        return _extraDataV2Priced(payer, clientDataSetId, withCDN, sig, currency, 0);
+    }
+
+    function _extraDataV2Priced(
+        address payer,
+        uint256 clientDataSetId,
+        bool withCDN,
+        bytes memory sig,
+        address currency,
+        uint256 price
+    ) internal pure returns (bytes memory) {
         (string[] memory keys, string[] memory values) = _metadata(withCDN);
-        return abi.encode(payer, clientDataSetId, keys, values, sig, currency);
+        return abi.encode(payer, clientDataSetId, keys, values, sig, currency, price);
     }
 
     function _extraDataV1(address payer, uint256 clientDataSetId, bytes memory sig)
@@ -307,7 +320,12 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
 
         bytes32 structHash = keccak256(
             abi.encode(
-                CREATE_DATA_SET_WITH_CURRENCY_TYPEHASH, uint256(12), serviceProvider, address(axl), _metadataHash(false)
+                CREATE_DATA_SET_WITH_PAYMENT_TYPEHASH,
+                uint256(12),
+                serviceProvider,
+                _metadataHash(false),
+                address(axl),
+                uint256(0)
             )
         );
         bytes memory sig = _sign(structHash);
@@ -592,6 +610,120 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
             sessionKeyRegistry,
             4
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // #619 agreed prices in a non-default currency (combined 618 + 619)
+
+    function _createV2Priced(address currency, uint256 price) internal returns (uint256 dataSetId) {
+        makeSignaturePass(client);
+        vm.prank(serviceProvider);
+        dataSetId = mockPDPVerifier.createDataSet(
+            pdpServiceWithPayments,
+            _extraDataV2Priced(client, nextClientDataSetId++, false, FAKE_SIGNATURE, currency, price)
+        );
+    }
+
+    function _sixDecimalRate(uint256 leafCount, uint256 price) internal pure returns (uint256) {
+        return
+            (Cids.leafCountToRawSize(leafCount) * price) / (TIB_IN_BYTES * EPOCHS_PER_MONTH) + SIX_DATASET_FEE_PER_EPOCH;
+    }
+
+    function _grow(uint256 dataSetId) internal returns (uint256 leafCount) {
+        mockPDPVerifier.setDataSetLeafCount(dataSetId, (100 * 1024 * 1024 * 1024) / 32); // ~100 GiB
+        _addPieces(dataSetId, 1);
+        leafCount = mockPDPVerifier.getDataSetLeafCount(dataSetId);
+    }
+
+    /// The agreed price is in the data set's token units: $5.00 per TiB-month is 5_000_000 axlUSDC units.
+    function testSixDecimalAgreedPriceSetsRailRate() public withTokens {
+        pdpServiceWithPayments.setCurrency(address(axl), true);
+        _fund(client, axl, 1000e6);
+        uint256 price = 5_000_000;
+        uint256 dataSetId = _createV2Priced(address(axl), price);
+        (uint256 stored,) = viewContract.getDataSetStoragePrice(dataSetId);
+        assertEq(stored, price);
+
+        uint256 leafCount = _grow(dataSetId);
+        assertEq(_pdpRail(dataSetId).paymentRate, _sixDecimalRate(leafCount, price));
+        assertGt(_sixDecimalRate(leafCount, price), _sixDecimalRate(leafCount, SIX_STORAGE_PER_TIB_MONTH));
+        assertEq(address(_pdpRail(dataSetId).token), address(axl));
+    }
+
+    /// The floor is the posted price in the data set's token units, not the 18-decimal constant.
+    function testSixDecimalPriceFloorIsScaledPostedPrice() public withTokens {
+        pdpServiceWithPayments.setCurrency(address(axl), true);
+        _fund(client, axl, 1000e6);
+
+        makeSignaturePass(client);
+        vm.prank(serviceProvider);
+        vm.expectRevert(abi.encodeWithSelector(Errors.InvalidStoragePrice.selector, SIX_STORAGE_PER_TIB_MONTH - 1));
+        mockPDPVerifier.createDataSet(
+            pdpServiceWithPayments,
+            _extraDataV2Priced(client, 51, false, FAKE_SIGNATURE, address(axl), SIX_STORAGE_PER_TIB_MONTH - 1)
+        );
+
+        uint256 dataSetId = _createV2Priced(address(axl), SIX_STORAGE_PER_TIB_MONTH);
+        uint256 leafCount = _grow(dataSetId);
+        assertEq(_pdpRail(dataSetId).paymentRate, _sixDecimalRate(leafCount, SIX_STORAGE_PER_TIB_MONTH));
+    }
+
+    /// A zero price in a 6-decimal currency pays the 6-decimal posted price.
+    function testSixDecimalZeroPricePaysScaledPostedPrice() public withTokens {
+        pdpServiceWithPayments.setCurrency(address(axl), true);
+        _fund(client, axl, 1000e6);
+        uint256 dataSetId = _createV2Priced(address(axl), 0);
+        uint256 leafCount = _grow(dataSetId);
+        assertEq(_pdpRail(dataSetId).paymentRate, _sixDecimalRate(leafCount, SIX_STORAGE_PER_TIB_MONTH));
+    }
+
+    /// updateStoragePrice on a 6-decimal data set uses the scaled floor and re-prices at once.
+    function testSixDecimalUpdateStoragePrice() public withTokens {
+        pdpServiceWithPayments.setCurrency(address(axl), true);
+        _fund(client, axl, 1000e6);
+        uint256 dataSetId = _createV2Priced(address(axl), 0);
+        uint256 leafCount = _grow(dataSetId);
+
+        makeSignaturePass(client);
+        vm.prank(serviceProvider);
+        vm.expectRevert(abi.encodeWithSelector(Errors.InvalidStoragePrice.selector, SIX_STORAGE_PER_TIB_MONTH - 1));
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, SIX_STORAGE_PER_TIB_MONTH - 1, 0, FAKE_SIGNATURE);
+
+        uint256 newPrice = 4_000_000;
+        vm.prank(serviceProvider);
+        pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, FAKE_SIGNATURE);
+        assertEq(_pdpRail(dataSetId).paymentRate, _sixDecimalRate(leafCount, newPrice));
+        (uint256 stored, uint256 nonce) = viewContract.getDataSetStoragePrice(dataSetId);
+        assertEq(stored, newPrice);
+        assertEq(nonce, 1);
+    }
+
+    /// A session key holding only the CreateDataSet permission may choose a currency (price 0) but may not
+    /// sign a price: a price above the posted one spends more of the payer's rate allowance.
+    function testSessionKeyCreateDataSetPermissionCannotSignPrice() public withTokens {
+        pdpServiceWithPayments.setCurrency(address(axl), true);
+        _fund(client, axl, 1000e6);
+        bytes32[] memory permissions = new bytes32[](1);
+        permissions[0] = CREATE_DATA_SET_TYPEHASH_V1;
+        vm.prank(client);
+        sessionKeyRegistry.login(sessionKey1, block.timestamp + 1 days, permissions, "mc");
+
+        makeSignaturePass(sessionKey1);
+        vm.prank(serviceProvider);
+        vm.expectRevert(abi.encodeWithSelector(Errors.InvalidSignature.selector, client, sessionKey1));
+        mockPDPVerifier.createDataSet(
+            pdpServiceWithPayments, _extraDataV2Priced(client, 61, false, FAKE_SIGNATURE, address(axl), 5_000_000)
+        );
+
+        permissions[0] = CREATE_DATA_SET_WITH_PAYMENT_TYPEHASH;
+        vm.prank(client);
+        sessionKeyRegistry.login(sessionKey1, block.timestamp + 1 days, permissions, "mc");
+        vm.prank(serviceProvider);
+        uint256 dataSetId = mockPDPVerifier.createDataSet(
+            pdpServiceWithPayments, _extraDataV2Priced(client, 61, false, FAKE_SIGNATURE, address(axl), 5_000_000)
+        );
+        (uint256 stored,) = viewContract.getDataSetStoragePrice(dataSetId);
+        assertEq(stored, 5_000_000);
     }
 
     // ---------------------------------------------------------------------

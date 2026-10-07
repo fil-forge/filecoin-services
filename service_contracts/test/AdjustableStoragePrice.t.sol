@@ -256,7 +256,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         uint256 cdsId = clientDataSetIdCounter++;
         bytes memory sig = _signCreateWithPayment(payerKey, cdsId, sp1, other, 0);
         bytes memory extraData = _withPaymentExtraData(cdsId, other, 0, sig);
-        vm.expectRevert(abi.encodeWithSelector(Errors.UnsupportedPaymentToken.selector, other));
+        vm.expectRevert(abi.encodeWithSelector(Errors.UnsupportedCurrency.selector, other)); // not whitelisted (#618)
         vm.prank(sp1);
         mockPDPVerifier.createDataSet(pdpServiceWithPayments, extraData);
     }
