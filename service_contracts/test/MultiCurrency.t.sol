@@ -13,7 +13,7 @@ import {Errors} from "../src/Errors.sol";
 import {PriceList} from "../src/lib/PriceList.sol";
 import {DATA_SET_INFO_SLOT} from "../src/lib/FilecoinWarmStorageServiceLayout.sol";
 import {ServiceProviderRegistryStorage} from "../src/ServiceProviderRegistryStorage.sol";
-import {DATA_SET_INFO_ROOT_SLOT} from "../src/lib/Rails.sol";
+import {DATA_SET_INFO_ROOT_SLOT, DataSetInfoRecord, Rails} from "../src/lib/Rails.sol";
 import {
     FWSS_CURRENCY_STORAGE_SLOT,
     FWSS_DATA_SET_PRICING_STORAGE_SLOT,
@@ -84,7 +84,8 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
     uint256 constant SIX_TERMINATE_FEE = 6_000; // $0.006
     uint256 constant SIX_DATASET_FEE_PER_EPOCH = 2; // ceil(1_388_888_888_888 / 10**12)
     uint256 constant SIX_STORAGE_PER_TIB_MONTH = 2_500_000; // $2.50
-    uint256 constant SIX_REQUIRED_LOCKUP = 620_000; // dataset fee month + reserve
+    // What the rail locks once pieces arrive: 2 units/epoch x 86,400-epoch lockup period + 500,000 reserve
+    uint256 constant SIX_REQUIRED_LOCKUP = 672_800;
     uint256 constant SIX_CDN_LOCKUP = 700_000;
     uint256 constant SIX_CACHE_MISS_LOCKUP = 300_000;
 
@@ -501,7 +502,14 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
         axl.approve(address(payments), 1);
         payments.deposit(axl, client, 1);
         vm.stopPrank();
-        _createV2(address(axl), false);
+        uint256 dataSetId = _createV2(address(axl), false);
+
+        // Funded with exactly the creation requirement, the payer can add pieces: the first add locks
+        // 2 units/epoch for the lockup period on top of the reserve, which is what creation required.
+        _addPieces(dataSetId, 1);
+        FilecoinPayV1.RailView memory rail = _pdpRail(dataSetId);
+        assertEq(rail.paymentRate, 2);
+        assertEq(rail.paymentRate * rail.lockupPeriod + SIX_RESERVE, SIX_REQUIRED_LOCKUP);
     }
 
     /// FilBeam settles in default-token units, so withCDN is rejected for any other currency.
@@ -574,18 +582,16 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
         _fund(client, axl, 1000e6);
         uint256 dataSetId = _createV2(address(axl), false);
 
-        // ~100 GiB so the size-proportional term is non-zero at 6 decimals
-        uint256 baseLeaves = (100 * 1024 * 1024 * 1024) / 32;
-        mockPDPVerifier.setDataSetLeafCount(dataSetId, baseLeaves);
+        // ~50 GiB: size term ~1.413 units/epoch, dataset fee ~1.389 units/epoch at 6 decimals
+        mockPDPVerifier.setDataSetLeafCount(dataSetId, (50 * 1024 * 1024 * 1024) / 32);
         _addPieces(dataSetId, 1);
-        uint256 leafCount = mockPDPVerifier.getDataSetLeafCount(dataSetId);
-
-        uint256 rawBytes = Cids.leafCountToRawSize(leafCount);
+        uint256 rawBytes = Cids.leafCountToRawSize(mockPDPVerifier.getDataSetLeafCount(dataSetId));
         uint256 sizeTerm18 = (rawBytes * STORAGE_PRICE_PER_TIB_PER_MONTH) / (TIB_IN_BYTES * EPOCHS_PER_MONTH);
-        uint256 expected = _ceil(sizeTerm18 + DATASET_FEE_PER_EPOCH, 1e12);
-        assertGt((sizeTerm18 + DATASET_FEE_PER_EPOCH) % 1e12, 0, "sum must not be a whole number of units");
-        assertEq(_pdpRail(dataSetId).paymentRate, expected);
-        assertLe(expected, _ceil(sizeTerm18, 1e12) + _ceil(DATASET_FEE_PER_EPOCH, 1e12), "never above two roundings");
+
+        // One rounding of the sum: ceil(2.80) = 3. Rounding each term would charge ceil(1.41) + ceil(1.39) = 4.
+        assertEq(_ceil(sizeTerm18 + DATASET_FEE_PER_EPOCH, 1e12), 3);
+        assertEq(_ceil(sizeTerm18, 1e12) + _ceil(DATASET_FEE_PER_EPOCH, 1e12), 4);
+        assertEq(_pdpRail(dataSetId).paymentRate, 3);
     }
 
     function testSecondEighteenDecimalCurrencyChargesSameAsUSDFC() public withTokens {
@@ -1135,5 +1141,74 @@ contract MultiCurrencyTest is FilecoinWarmStorageServiceTest {
         vm.expectRevert(abi.encodeWithSelector(Errors.InvalidCommissionBps.selector, uint256(10_001)));
         pdpServiceWithPayments.setCurrency(address(axl), true, 10_001);
         pdpServiceWithPayments.setCurrency(address(axl), true, 10_000);
+    }
+
+    // ---------------------------------------------------------------------
+    // Rails' copy of DataSetInfo
+
+    /// Rails reads and writes FWSS's DataSetInfo through DataSetInfoRecord at the pinned root slot. Writing the same
+    /// values through both struct types must give the same 11 storage words, member by member.
+    function testDataSetInfoRecordMatchesDataSetInfoLayout() public {
+        DataSetInfoLayoutProbe probe = new DataSetInfoLayoutProbe();
+        (bytes32[11] memory fwss, bytes32[11] memory record) = probe.writeBoth(42);
+        for (uint256 i = 0; i < 11; i++) {
+            assertEq(record[i], fwss[i]);
+        }
+        assertTrue(fwss[10] != bytes32(0), "packed word 10 exercised");
+        assertEq(DATA_SET_INFO_ROOT_SLOT, DATA_SET_INFO_SLOT);
+    }
+}
+
+/// @dev Writes distinct values through FWSS's DataSetInfo and through Rails' DataSetInfoRecord (each in this
+///      contract's own storage) and returns the raw words of both records.
+contract DataSetInfoLayoutProbe {
+    mapping(uint256 => FilecoinWarmStorageService.DataSetInfo) private fwssInfos;
+
+    function writeBoth(uint256 dataSetId) external returns (bytes32[11] memory fwss, bytes32[11] memory record) {
+        FilecoinWarmStorageService.DataSetInfo storage a = fwssInfos[dataSetId];
+        a.pdpRailId = 1;
+        a.cacheMissRailId = 2;
+        a.cdnRailId = 3;
+        a.payer = address(4);
+        a.payee = address(5);
+        a.serviceProvider = address(6);
+        a.commissionBps = 7;
+        a.clientDataSetId = 8;
+        a.pdpEndEpoch = 9;
+        a.providerId = 10;
+        a.pendingOneTimePayments = 11;
+        a.lifecycleReserveBalance = 12;
+
+        DataSetInfoRecord storage b = Rails.dataSetInfo(dataSetId);
+        b.pdpRailId = 1;
+        b.cacheMissRailId = 2;
+        b.cdnRailId = 3;
+        b.payer = address(4);
+        b.payee = address(5);
+        b.serviceProvider = address(6);
+        b.commissionBps = 7;
+        b.clientDataSetId = 8;
+        b.pdpEndEpoch = 9;
+        b.providerId = 10;
+        b.pendingOneTimePayments = 11;
+        b.lifecycleReserveBalance = 12;
+
+        uint256 aSlot;
+        uint256 bSlot;
+        assembly ("memory-safe") {
+            aSlot := a.slot
+            bSlot := b.slot
+        }
+        require(aSlot != bSlot, "distinct records");
+        for (uint256 i = 0; i < 11; i++) {
+            uint256 x;
+            uint256 y;
+            assembly ("memory-safe") {
+                x := sload(add(aSlot, i))
+                y := sload(add(bSlot, i))
+            }
+            fwss[i] = bytes32(x);
+            record[i] = bytes32(y);
+        }
     }
 }
