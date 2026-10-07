@@ -115,6 +115,14 @@ contract FilecoinWarmStorageServiceStateView is IPDPProvingSchedule {
         return service.getDataSetStatus(dataSetId);
     }
 
+    function getDataSetStoragePrice(uint256 dataSetId)
+        external
+        view
+        returns (uint256 storagePricePerTibPerMonth, uint256 nonce)
+    {
+        return service.getDataSetStoragePrice(dataSetId);
+    }
+
     function getPDPConfig()
         external
         view

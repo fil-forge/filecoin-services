@@ -367,4 +367,18 @@ library Errors {
     /// @param requiredEpoch The first epoch at which abandonment is allowed
     /// @param currentBlock The current block number
     error DataSetNotAbandoned(uint256 dataSetId, uint256 requiredEpoch, uint256 currentBlock);
+
+    /// @notice A client-agreed storage price is below the posted price or does not fit in 128 bits
+    /// @param storagePricePerTibPerMonth The rejected price (0 means the posted price and is always valid)
+    error InvalidStoragePrice(uint256 storagePricePerTibPerMonth);
+
+    /// @notice The price-update nonce does not match the data set's current nonce
+    /// @param dataSetId The data set ID
+    /// @param expected The data set's current nonce
+    /// @param actual The nonce supplied (and signed)
+    error InvalidStoragePriceNonce(uint256 dataSetId, uint256 expected, uint256 actual);
+
+    /// @notice The data set creation names a token this deployment does not accept
+    /// @param token The requested token
+    error UnsupportedPaymentToken(address token);
 }

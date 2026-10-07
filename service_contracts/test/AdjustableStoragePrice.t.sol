@@ -6,8 +6,7 @@ import {FilecoinPayV1} from "@fws-payments/FilecoinPayV1.sol";
 import {FilecoinWarmStorageServiceTest, TestDataSetAuthorizer} from "./FilecoinWarmStorageService.t.sol";
 import {FilecoinWarmStorageService} from "../src/FilecoinWarmStorageService.sol";
 import {Errors} from "../src/Errors.sol";
-import {DataSetStoragePriceSet} from "../src/lib/Rails.sol";
-import {DATA_SET_PRICING_STORAGE_SLOT} from "../src/lib/DataSetPricing.sol";
+import {DATA_SET_PRICING_STORAGE_SLOT, DataSetStoragePriceSet} from "../src/lib/DataSetPricing.sol";
 import {
     DATASET_FEE_PER_EPOCH,
     EPOCHS_PER_MONTH,
@@ -44,8 +43,13 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
 
     uint256 private clientDataSetIdCounter = 1000;
 
-    function setUp() public override {
-        super.setUp();
+    // The base suite's setUp is not virtual, so each test funds its payer through this modifier.
+    modifier payerReady() {
+        _initPayer();
+        _;
+    }
+
+    function _initPayer() private {
         (payer, payerKey) = makeAddrAndKey("fil1276-payer");
         (sessionSigner, sessionSignerKey) = makeAddrAndKey("fil1276-session-key");
         mockUSDFC.transfer(payer, 1000e18);
@@ -63,9 +67,8 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
     function _metadataHash(string[] memory keys, string[] memory values) private pure returns (bytes32) {
         bytes32[] memory entries = new bytes32[](keys.length);
         for (uint256 i = 0; i < keys.length; i++) {
-            entries[i] = keccak256(
-                abi.encode(METADATA_ENTRY_TYPEHASH_, keccak256(bytes(keys[i])), keccak256(bytes(values[i])))
-            );
+            entries[i] =
+                keccak256(abi.encode(METADATA_ENTRY_TYPEHASH_, keccak256(bytes(keys[i])), keccak256(bytes(values[i]))));
         }
         return keccak256(abi.encodePacked(entries));
     }
@@ -82,13 +85,11 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         return abi.encodePacked(r, s, v);
     }
 
-    function _signCreateWithPayment(
-        uint256 key,
-        uint256 clientDataSetId,
-        address payee,
-        address token,
-        uint256 price
-    ) private view returns (bytes memory) {
+    function _signCreateWithPayment(uint256 key, uint256 clientDataSetId, address payee, address token, uint256 price)
+        private
+        view
+        returns (bytes memory)
+    {
         (string[] memory keys, string[] memory values) = _label();
         return _sign(
             key,
@@ -124,12 +125,11 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         return _sign(key, keccak256(abi.encode(UPDATE_STORAGE_PRICE_TYPEHASH, dataSetId, nonce, price)));
     }
 
-    function _withPaymentExtraData(
-        uint256 clientDataSetId,
-        address token,
-        uint256 price,
-        bytes memory signature
-    ) private view returns (bytes memory) {
+    function _withPaymentExtraData(uint256 clientDataSetId, address token, uint256 price, bytes memory signature)
+        private
+        view
+        returns (bytes memory)
+    {
         (string[] memory keys, string[] memory values) = _label();
         return abi.encode(payer, clientDataSetId, keys, values, signature, token, price);
     }
@@ -172,7 +172,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
     // Creation
     // ------------------------------------------------------------------
 
-    function test_legacyExtraData_paysPostedPrice() public {
+    function test_legacyExtraData_paysPostedPrice() public payerReady {
         uint256 cdsId = clientDataSetIdCounter++;
         bytes memory sig = _signCreateLegacy(payerKey, cdsId, sp1);
         vm.prank(sp1);
@@ -186,7 +186,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         assertEq(_railRate(dataSetId), _expectedRate(leafCount, STORAGE_PRICE_PER_TIB_PER_MONTH), "posted rate");
     }
 
-    function test_withPayment_customPrice_setsRailRate() public {
+    function test_withPayment_customPrice_setsRailRate() public payerReady {
         uint256 price = 2 * STORAGE_PRICE_PER_TIB_PER_MONTH;
         uint256 cdsId = clientDataSetIdCounter++;
         bytes memory sig = _signCreateWithPayment(payerKey, cdsId, sp1, address(0), price);
@@ -207,19 +207,19 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         assertGt(rate, _expectedRate(leafCount, STORAGE_PRICE_PER_TIB_PER_MONTH), "above posted");
     }
 
-    function test_withPayment_zeroPrice_paysPosted() public {
+    function test_withPayment_zeroPrice_paysPosted() public payerReady {
         uint256 dataSetId = _createWithPrice(0);
         uint256 leafCount = _addPiece(dataSetId);
         assertEq(_railRate(dataSetId), _expectedRate(leafCount, STORAGE_PRICE_PER_TIB_PER_MONTH));
     }
 
-    function test_withPayment_postedPriceExactly_accepted() public {
+    function test_withPayment_postedPriceExactly_accepted() public payerReady {
         uint256 dataSetId = _createWithPrice(STORAGE_PRICE_PER_TIB_PER_MONTH);
         uint256 leafCount = _addPiece(dataSetId);
         assertEq(_railRate(dataSetId), _expectedRate(leafCount, STORAGE_PRICE_PER_TIB_PER_MONTH));
     }
 
-    function test_withPayment_belowPosted_reverts() public {
+    function test_withPayment_belowPosted_reverts() public payerReady {
         uint256 price = STORAGE_PRICE_PER_TIB_PER_MONTH - 1;
         uint256 cdsId = clientDataSetIdCounter++;
         bytes memory sig = _signCreateWithPayment(payerKey, cdsId, sp1, address(0), price);
@@ -229,7 +229,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         mockPDPVerifier.createDataSet(pdpServiceWithPayments, extraData);
     }
 
-    function test_withPayment_priceAboveUint128_reverts() public {
+    function test_withPayment_priceAboveUint128_reverts() public payerReady {
         uint256 price = uint256(type(uint128).max) + 1;
         uint256 cdsId = clientDataSetIdCounter++;
         bytes memory sig = _signCreateWithPayment(payerKey, cdsId, sp1, address(0), price);
@@ -239,7 +239,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         mockPDPVerifier.createDataSet(pdpServiceWithPayments, extraData);
     }
 
-    function test_withPayment_deploymentToken_accepted() public {
+    function test_withPayment_deploymentToken_accepted() public payerReady {
         uint256 price = 3 * STORAGE_PRICE_PER_TIB_PER_MONTH;
         uint256 cdsId = clientDataSetIdCounter++;
         bytes memory sig = _signCreateWithPayment(payerKey, cdsId, sp1, address(mockUSDFC), price);
@@ -251,7 +251,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         assertEq(stored, price);
     }
 
-    function test_withPayment_otherToken_reverts() public {
+    function test_withPayment_otherToken_reverts() public payerReady {
         address other = address(0xBEEF);
         uint256 cdsId = clientDataSetIdCounter++;
         bytes memory sig = _signCreateWithPayment(payerKey, cdsId, sp1, other, 0);
@@ -261,7 +261,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         mockPDPVerifier.createDataSet(pdpServiceWithPayments, extraData);
     }
 
-    function test_withPayment_providerCannotChangeSignedPrice() public {
+    function test_withPayment_providerCannotChangeSignedPrice() public payerReady {
         uint256 signedPrice = 2 * STORAGE_PRICE_PER_TIB_PER_MONTH;
         uint256 cdsId = clientDataSetIdCounter++;
         bytes memory sig = _signCreateWithPayment(payerKey, cdsId, sp1, address(0), signedPrice);
@@ -271,7 +271,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         mockPDPVerifier.createDataSet(pdpServiceWithPayments, extraData);
     }
 
-    function test_withPayment_signatureBindsPayee() public {
+    function test_withPayment_signatureBindsPayee() public payerReady {
         uint256 price = 2 * STORAGE_PRICE_PER_TIB_PER_MONTH;
         uint256 cdsId = clientDataSetIdCounter++;
         bytes memory sig = _signCreateWithPayment(payerKey, cdsId, sp1, address(0), price);
@@ -283,7 +283,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
 
     /// A provider holding a legacy CreateDataSet signature cannot re-encode it into the new variant
     /// and attach a price: the variant is verified against its own type hash.
-    function test_legacySignature_reencodedWithPrice_rejected() public {
+    function test_legacySignature_reencodedWithPrice_rejected() public payerReady {
         uint256 cdsId = clientDataSetIdCounter++;
         bytes memory legacySig = _signCreateLegacy(payerKey, cdsId, sp1);
         bytes memory extraData = _withPaymentExtraData(cdsId, address(0), 0, legacySig);
@@ -292,7 +292,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         mockPDPVerifier.createDataSet(pdpServiceWithPayments, extraData);
     }
 
-    function test_withPayment_sessionKeyNeedsNewPermission() public {
+    function test_withPayment_sessionKeyNeedsNewPermission() public payerReady {
         uint256 price = 2 * STORAGE_PRICE_PER_TIB_PER_MONTH;
 
         // A session key allowed only CreateDataSet cannot sign a priced creation.
@@ -323,7 +323,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
     // Mutual-consent update
     // ------------------------------------------------------------------
 
-    function test_update_repricesIdleDataSetImmediately() public {
+    function test_update_repricesIdleDataSetImmediately() public payerReady {
         uint256 dataSetId = _createWithPrice(0);
         uint256 leafCount = _addPiece(dataSetId);
         assertEq(_railRate(dataSetId), _expectedRate(leafCount, STORAGE_PRICE_PER_TIB_PER_MONTH));
@@ -343,7 +343,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         assertEq(nonce, 1, "nonce consumed");
     }
 
-    function test_update_lowerToPosted_byConsent() public {
+    function test_update_lowerToPosted_byConsent() public payerReady {
         uint256 dataSetId = _createWithPrice(3 * STORAGE_PRICE_PER_TIB_PER_MONTH);
         uint256 leafCount = _addPiece(dataSetId);
         bytes memory sig = _signUpdate(payerKey, dataSetId, 0, 0);
@@ -352,7 +352,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         assertEq(_railRate(dataSetId), _expectedRate(leafCount, STORAGE_PRICE_PER_TIB_PER_MONTH), "back to posted");
     }
 
-    function test_update_beforeAnyPiece_appliesOnFirstAdd() public {
+    function test_update_beforeAnyPiece_appliesOnFirstAdd() public payerReady {
         uint256 dataSetId = _createWithPrice(0);
         uint256 newPrice = 2 * STORAGE_PRICE_PER_TIB_PER_MONTH;
         bytes memory sig = _signUpdate(payerKey, dataSetId, 0, newPrice);
@@ -364,7 +364,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         assertEq(_railRate(dataSetId), _expectedRate(leafCount, newPrice));
     }
 
-    function test_update_onlyServiceProvider() public {
+    function test_update_onlyServiceProvider() public payerReady {
         uint256 dataSetId = _createWithPrice(0);
         uint256 newPrice = 2 * STORAGE_PRICE_PER_TIB_PER_MONTH;
         bytes memory sig = _signUpdate(payerKey, dataSetId, 0, newPrice);
@@ -373,7 +373,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, sig);
     }
 
-    function test_update_requiresPayerSignature() public {
+    function test_update_requiresPayerSignature() public payerReady {
         uint256 dataSetId = _createWithPrice(0);
         uint256 newPrice = 2 * STORAGE_PRICE_PER_TIB_PER_MONTH;
         (, uint256 strangerKey) = makeAddrAndKey("stranger");
@@ -383,7 +383,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, sig);
     }
 
-    function test_update_providerCannotChangeSignedPrice() public {
+    function test_update_providerCannotChangeSignedPrice() public payerReady {
         uint256 dataSetId = _createWithPrice(0);
         bytes memory sig = _signUpdate(payerKey, dataSetId, 0, 2 * STORAGE_PRICE_PER_TIB_PER_MONTH);
         vm.expectPartialRevert(Errors.InvalidSignature.selector);
@@ -391,7 +391,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         pdpServiceWithPayments.updateStoragePrice(dataSetId, 9 * STORAGE_PRICE_PER_TIB_PER_MONTH, 0, sig);
     }
 
-    function test_update_replayRejected() public {
+    function test_update_replayRejected() public payerReady {
         uint256 dataSetId = _createWithPrice(0);
         uint256 high = 3 * STORAGE_PRICE_PER_TIB_PER_MONTH;
         bytes memory toHigh = _signUpdate(payerKey, dataSetId, 0, high);
@@ -408,7 +408,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         pdpServiceWithPayments.updateStoragePrice(dataSetId, high, 0, toHigh);
     }
 
-    function test_update_signatureBoundToDataSet() public {
+    function test_update_signatureBoundToDataSet() public payerReady {
         uint256 a = _createWithPrice(0);
         uint256 b = _createWithPrice(0);
         uint256 newPrice = 2 * STORAGE_PRICE_PER_TIB_PER_MONTH;
@@ -418,7 +418,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         pdpServiceWithPayments.updateStoragePrice(b, newPrice, 0, sigForA);
     }
 
-    function test_update_belowPosted_reverts() public {
+    function test_update_belowPosted_reverts() public payerReady {
         uint256 dataSetId = _createWithPrice(0);
         uint256 price = STORAGE_PRICE_PER_TIB_PER_MONTH / 2;
         bytes memory sig = _signUpdate(payerKey, dataSetId, 0, price);
@@ -427,7 +427,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         pdpServiceWithPayments.updateStoragePrice(dataSetId, price, 0, sig);
     }
 
-    function test_update_terminated_reverts() public {
+    function test_update_terminated_reverts() public payerReady {
         uint256 dataSetId = _createWithPrice(0);
         _addPiece(dataSetId);
         vm.prank(payer);
@@ -440,13 +440,13 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         pdpServiceWithPayments.updateStoragePrice(dataSetId, newPrice, 0, sig);
     }
 
-    function test_update_unknownDataSet_reverts() public {
+    function test_update_unknownDataSet_reverts() public payerReady {
         vm.expectRevert(abi.encodeWithSelector(Errors.InvalidDataSetId.selector, 999));
         vm.prank(sp1);
         pdpServiceWithPayments.updateStoragePrice(999, 0, 0, "");
     }
 
-    function test_update_rateIncreaseNeedsPayerRateAllowance() public {
+    function test_update_rateIncreaseNeedsPayerRateAllowance() public payerReady {
         uint256 dataSetId = _createWithPrice(0);
         uint256 leafCount = _addPiece(dataSetId);
         uint256 postedRate = _expectedRate(leafCount, STORAGE_PRICE_PER_TIB_PER_MONTH);
@@ -467,7 +467,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         assertEq(_railRate(dataSetId), postedRate);
     }
 
-    function test_update_sessionKeyWithPermission() public {
+    function test_update_sessionKeyWithPermission() public payerReady {
         uint256 dataSetId = _createWithPrice(0);
         bytes32[] memory permission = new bytes32[](1);
         permission[0] = UPDATE_STORAGE_PRICE_TYPEHASH;
@@ -482,7 +482,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
         assertEq(stored, newPrice);
     }
 
-    function test_update_usesDataSetAuthorizer() public {
+    function test_update_usesDataSetAuthorizer() public payerReady {
         uint256 dataSetId = _createWithPrice(0);
         TestDataSetAuthorizer authorizer = new TestDataSetAuthorizer(sessionKeyRegistry);
         (address delegate, uint256 delegateKey) = makeAddrAndKey("fil1276-delegate");
@@ -508,7 +508,7 @@ contract AdjustableStoragePriceTest is FilecoinWarmStorageServiceTest {
     // Storage layout
     // ------------------------------------------------------------------
 
-    function test_pricingNamespace_slotPinned() public {
+    function test_pricingNamespace_slotPinned() public payerReady {
         // keccak256(abi.encode(uint256(keccak256("filecoin-warm-storage-service.DataSetPricing")) - 1))
         //   & ~bytes32(uint256(0xff))
         assertEq(

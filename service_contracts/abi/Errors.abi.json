@@ -552,6 +552,38 @@
   },
   {
     "type": "error",
+    "name": "InvalidStoragePrice",
+    "inputs": [
+      {
+        "name": "storagePricePerTibPerMonth",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "InvalidStoragePriceNonce",
+    "inputs": [
+      {
+        "name": "dataSetId",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "expected",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "actual",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "InvalidTopUpAmount",
     "inputs": [
       {
@@ -962,6 +994,17 @@
         "name": "signature",
         "type": "bytes",
         "internalType": "bytes"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "UnsupportedPaymentToken",
+    "inputs": [
+      {
+        "name": "token",
+        "type": "address",
+        "internalType": "address"
       }
     ]
   },
