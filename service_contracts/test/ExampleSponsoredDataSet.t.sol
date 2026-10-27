@@ -9,10 +9,11 @@ import {SessionKeyRegistry} from "@session-key-registry/SessionKeyRegistry.sol";
 import {FilecoinPayV1} from "@fws-payments/FilecoinPayV1.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-import {FilecoinWarmStorageService, PDP_INACTIVITY_WINDOW} from "../src/FilecoinWarmStorageService.sol";
-import {FilecoinWarmStorageServiceStateView} from "../src/FilecoinWarmStorageServiceStateView.sol";
+import {IFilecoinWarmStorageService} from "../src/interfaces/IFilecoinWarmStorageService.sol";
+import {PDP_INACTIVITY_WINDOW} from "../src/lib/FWSSConstants.sol";
+import {FWSSDeployer} from "../script/lib/FWSSDeployer.sol";
 import {ExampleSponsoredDataSet, ExampleSponsoredDataSetFactory} from "../src/ExampleSponsoredDataSet.sol";
-import {SignatureVerificationLib} from "../src/lib/SignatureVerificationLib.sol";
+import {LibSignatureVerification} from "../src/lib/LibSignatureVerification.sol";
 import {LibRLP} from "solady/utils/LibRLP.sol";
 import {Errors} from "../src/Errors.sol";
 import {ServiceProviderRegistry} from "../src/ServiceProviderRegistry.sol";
@@ -22,7 +23,7 @@ import {PDPOffering} from "./PDPOffering.sol";
 import {PROVING_ACTIVATION_EPOCH_SLOT, PROVEN_THIS_PERIOD_SLOT} from "../src/lib/FilecoinWarmStorageServiceLayout.sol";
 import {DATA_SET_LAST_PROVEN_EPOCH_SLOT} from "../lib/pdp/src/PDPVerifierLayout.sol";
 
-contract ExampleSponsoredDataSetTest is MockFVMTest {
+contract ExampleSponsoredDataSetTest is MockFVMTest, FWSSDeployer {
     using PDPOffering for PDPOffering.Schema;
 
     uint256 constant CLEANUP_DEPOSIT = 0.1 ether;
@@ -39,8 +40,7 @@ contract ExampleSponsoredDataSetTest is MockFVMTest {
         keccak256("SchedulePieceRemovals(uint256 clientDataSetId,uint256[] pieceIds)");
 
     PDPVerifier pdpVerifier;
-    FilecoinWarmStorageService fwss;
-    FilecoinWarmStorageServiceStateView viewContract;
+    IFilecoinWarmStorageService fwss;
     FilecoinPayV1 payments;
     MockERC20 token;
     SessionKeyRegistry sessionKeyRegistry;
@@ -80,26 +80,19 @@ contract ExampleSponsoredDataSetTest is MockFVMTest {
         pdpVerifier =
             PDPVerifier(address(new MyERC1967Proxy(address(pdpImpl), abi.encodeCall(PDPVerifier.initialize, ()))));
 
-        FilecoinWarmStorageService fwssImpl = new FilecoinWarmStorageService(
-            address(pdpVerifier),
-            address(payments),
-            token,
-            address(0xfb),
-            serviceProviderRegistry,
-            sessionKeyRegistry,
-            4
+        fwss = _deployFWSS(
+            FWSSDeployment({
+                payments: address(payments),
+                pdpVerifier: address(pdpVerifier),
+                usdfc: address(token),
+                filBeamBeneficiary: address(0xfb),
+                serviceProviderRegistry: address(serviceProviderRegistry),
+                sessionKeyRegistry: address(sessionKeyRegistry),
+                maxProvingPeriod: 2880,
+                challengeWindowSize: 60,
+                filBeamController: address(0xfc)
+            })
         );
-        fwss = FilecoinWarmStorageService(
-            address(
-                new MyERC1967Proxy(
-                    address(fwssImpl),
-                    abi.encodeCall(FilecoinWarmStorageService.initialize, (uint64(2880), uint256(60), address(0xfc)))
-                )
-            )
-        );
-
-        viewContract = new FilecoinWarmStorageServiceStateView(fwss);
-        fwss.setViewContract(address(viewContract));
 
         PDPOffering.Schema memory schema = PDPOffering.Schema({
             serviceURL: "https://sp.test",
@@ -145,7 +138,7 @@ contract ExampleSponsoredDataSetTest is MockFVMTest {
         for (uint256 i = 0; i < keys.length; i++) {
             entryHashes[i] = keccak256(
                 abi.encode(
-                    SignatureVerificationLib.METADATA_ENTRY_TYPEHASH,
+                    LibSignatureVerification.METADATA_ENTRY_TYPEHASH,
                     keccak256(bytes(keys[i])),
                     keccak256(bytes(values[i]))
                 )
@@ -161,7 +154,7 @@ contract ExampleSponsoredDataSetTest is MockFVMTest {
     {
         return keccak256(
             abi.encode(
-                SignatureVerificationLib.CREATE_DATA_SET_TYPEHASH,
+                LibSignatureVerification.CREATE_DATA_SET_TYPEHASH,
                 uint256(0),
                 _payee,
                 _hashMetadataEntries(keys, values)
@@ -187,13 +180,13 @@ contract ExampleSponsoredDataSetTest is MockFVMTest {
         assertTrue(signer != address(0));
         assertEq(
             sessionKeyRegistry.authorizationExpiry(
-                address(dataSet), signer, SignatureVerificationLib.CREATE_DATA_SET_TYPEHASH
+                address(dataSet), signer, LibSignatureVerification.CREATE_DATA_SET_TYPEHASH
             ),
             type(uint256).max
         );
         assertEq(
             sessionKeyRegistry.authorizationExpiry(
-                address(dataSet), address(0), SignatureVerificationLib.CREATE_DATA_SET_TYPEHASH
+                address(dataSet), address(0), LibSignatureVerification.CREATE_DATA_SET_TYPEHASH
             ),
             0
         );
