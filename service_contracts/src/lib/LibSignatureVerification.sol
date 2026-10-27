@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.37;
 
 import {Cids} from "@pdp/Cids.sol";
 import {SessionKeyRegistry} from "@session-key-registry/SessionKeyRegistry.sol";
 import {Errors} from "../Errors.sol";
 import {IDataSetAuthorizer} from "../interfaces/IDataSetAuthorizer.sol";
 
-/// @title SignatureVerificationLib
-/// @notice Library for EIP-712 signature verification and metadata hashing
-/// @dev This is an external library (deployed separately) to reduce main contract size.
-///      Functions are marked public/external so they use DELEGATECALL rather than being inlined.
-library SignatureVerificationLib {
+/// @title LibSignatureVerification
+/// @notice EIP-712 signature verification and metadata hashing inlined into the FWSS modules.
+/// @dev Memory parameters support the decoded operation data used by FWSS modules.
+library LibSignatureVerification {
     // ============================================================================
     // EIP-712 Type hashes
     // ============================================================================
@@ -47,7 +46,7 @@ library SignatureVerificationLib {
      * @param value The metadata value
      * @return Hash of the metadata entry struct
      */
-    function hashMetadataEntry(string calldata key, string calldata value) internal pure returns (bytes32) {
+    function hashMetadataEntry(string memory key, string memory value) internal pure returns (bytes32) {
         return keccak256(abi.encode(METADATA_ENTRY_TYPEHASH, keccak256(bytes(key)), keccak256(bytes(value))));
     }
 
@@ -57,7 +56,7 @@ library SignatureVerificationLib {
      * @param values Array of metadata values
      * @return Hash of all metadata entries
      */
-    function hashMetadataEntries(string[] calldata keys, string[] calldata values) internal pure returns (bytes32) {
+    function hashMetadataEntries(string[] memory keys, string[] memory values) internal pure returns (bytes32) {
         require(keys.length == values.length, Errors.MetadataKeyAndValueLengthMismatch(keys.length, values.length));
 
         bytes32[] memory entryHashes = new bytes32[](keys.length);
@@ -70,15 +69,15 @@ library SignatureVerificationLib {
     function createDataSetStructHash(
         uint256 clientDataSetId,
         address payee,
-        string[] calldata keys,
-        string[] calldata values
-    ) public pure returns (bytes32 structHash) {
+        string[] memory keys,
+        string[] memory values
+    ) internal pure returns (bytes32 structHash) {
         return keccak256(
             abi.encode(CREATE_DATA_SET_TYPEHASH, clientDataSetId, payee, hashMetadataEntries(keys, values))
         );
     }
 
-    function hashAllCids(Cids.Cid[] calldata pieceDataArray) internal pure returns (bytes32 cidHashesHash) {
+    function hashAllCids(Cids.Cid[] memory pieceDataArray) internal pure returns (bytes32 cidHashesHash) {
         bytes32[] memory cidHashes = new bytes32[](pieceDataArray.length);
         for (uint256 i = 0; i < pieceDataArray.length; i++) {
             cidHashes[i] = keccak256(abi.encode(CID_TYPEHASH, keccak256(pieceDataArray[i].data)));
@@ -89,10 +88,10 @@ library SignatureVerificationLib {
     function addPiecesStructHash(
         uint256 clientDataSetId,
         uint256 nonce,
-        Cids.Cid[] calldata pieceDataArray,
-        string[][] calldata allKeys,
-        string[][] calldata allValues
-    ) public pure returns (bytes32 structHash) {
+        Cids.Cid[] memory pieceDataArray,
+        string[][] memory allKeys,
+        string[][] memory allValues
+    ) internal pure returns (bytes32 structHash) {
         return keccak256(
             abi.encode(
                 ADD_PIECES_TYPEHASH,
@@ -111,7 +110,7 @@ library SignatureVerificationLib {
      * @param values Array of metadata values for this piece
      * @return Hash of the piece metadata struct
      */
-    function hashPieceMetadata(uint256 pieceIndex, string[] calldata keys, string[] calldata values)
+    function hashPieceMetadata(uint256 pieceIndex, string[] memory keys, string[] memory values)
         internal
         pure
         returns (bytes32)
@@ -126,8 +125,8 @@ library SignatureVerificationLib {
      * @param allValues 2D array where allValues[i] contains values for piece i
      * @return Hash of all piece metadata
      */
-    function hashAllPieceMetadata(string[][] calldata allKeys, string[][] calldata allValues)
-        public
+    function hashAllPieceMetadata(string[][] memory allKeys, string[][] memory allValues)
+        internal
         pure
         returns (bytes32)
     {
@@ -147,10 +146,10 @@ library SignatureVerificationLib {
     /**
      * @notice Recover the signer address from a signature
      * @param messageHash The signed message hash
-     * @param signature The signature bytes (v, r, s)
+     * @param signature The signature bytes (r, s, v)
      * @return The address that signed the message
      */
-    function recoverSigner(bytes32 messageHash, bytes calldata signature) public pure returns (address) {
+    function recoverSigner(bytes32 messageHash, bytes memory signature) internal pure returns (address) {
         require(signature.length == 65, Errors.InvalidSignatureLength(65, signature.length));
 
         bytes32 r;
@@ -158,10 +157,10 @@ library SignatureVerificationLib {
         uint8 v;
 
         // Extract r, s, v from the signature
-        assembly {
-            r := calldataload(signature.offset)
-            s := calldataload(add(signature.offset, 32))
-            v := byte(0, calldataload(add(signature.offset, 64)))
+        assembly ("memory-safe") {
+            r := mload(add(signature, 32))
+            s := mload(add(signature, 64))
+            v := byte(0, mload(add(signature, 96)))
         }
         uint8 originalV = v;
 
@@ -190,10 +189,10 @@ library SignatureVerificationLib {
      */
     function verifyCreateDataSetSignature(
         address payer,
-        bytes calldata signature,
+        bytes memory signature,
         bytes32 digest,
         SessionKeyRegistry sessionKeyRegistry
-    ) public view {
+    ) internal view {
         // The digest is already computed by the calling contract
         // Just use it directly for signature verification
 
@@ -215,14 +214,14 @@ library SignatureVerificationLib {
         uint256 dataSetId,
         address authorizer,
         uint256 clientDataSetId,
-        Cids.Cid[] calldata pieceDataArray,
+        Cids.Cid[] memory pieceDataArray,
         uint256 nonce,
-        string[][] calldata allKeys,
-        string[][] calldata allValues,
-        bytes calldata signature,
+        string[][] memory allKeys,
+        string[][] memory allValues,
+        bytes memory signature,
         bytes32 domainSeparator,
         SessionKeyRegistry sessionKeyRegistry
-    ) public {
+    ) internal {
         bytes32 digest = _toTypedDataHash(
             domainSeparator, addPiecesStructHash(clientDataSetId, nonce, pieceDataArray, allKeys, allValues)
         );
@@ -249,11 +248,11 @@ library SignatureVerificationLib {
         uint256 dataSetId,
         address authorizer,
         uint256 clientDataSetId,
-        uint256[] calldata pieceIds,
-        bytes calldata signature,
+        uint256[] memory pieceIds,
+        bytes memory signature,
         bytes32 domainSeparator,
         SessionKeyRegistry sessionKeyRegistry
-    ) public {
+    ) internal {
         bytes32 digest = _toTypedDataHash(
             domainSeparator,
             keccak256(
@@ -282,10 +281,10 @@ library SignatureVerificationLib {
         address payer,
         uint256 dataSetId,
         address authorizer,
-        bytes calldata signature,
+        bytes memory signature,
         bytes32 domainSeparator,
         SessionKeyRegistry sessionKeyRegistry
-    ) public returns (address) {
+    ) internal returns (address) {
         bytes32 digest = _toTypedDataHash(domainSeparator, keccak256(abi.encode(TERMINATE_SERVICE_TYPEHASH, dataSetId)));
 
         if (authorizer == address(0)) {
@@ -300,7 +299,7 @@ library SignatureVerificationLib {
     ///      most 63/64 of the remaining gas, so this only binds when the caller supplies more.
     uint256 internal constant AUTHORIZER_GAS_LIMIT = 150_000_000;
 
-    /// @dev Transient-storage slot for the authorizer reentrancy latch. This library is DELEGATECALL'd,
+    /// @dev Transient-storage slot for the authorizer reentrancy latch. This library is inlined,
     ///      so the slot lives in the calling contract's (FWSS's) transient storage and the latch therefore
     ///      spans the whole FWSS call frame, not just this library invocation.
     bytes32 internal constant AUTHORIZER_REENTRANCY_SLOT =
@@ -319,7 +318,7 @@ library SignatureVerificationLib {
 
     function _verifyAuthorizer(
         address payer,
-        bytes calldata signature,
+        bytes memory signature,
         bytes32 digest,
         bytes32 operation,
         uint256 dataSetId,
@@ -337,7 +336,7 @@ library SignatureVerificationLib {
 
     function _verifySignature(
         address payer,
-        bytes calldata signature,
+        bytes memory signature,
         bytes32 digest,
         bytes32 operation,
         SessionKeyRegistry sessionKeyRegistry

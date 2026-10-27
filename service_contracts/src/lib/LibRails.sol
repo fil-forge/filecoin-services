@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.37;
 
 import {Errors} from "../Errors.sol";
 import {FilecoinPayV1} from "@fws-payments/FilecoinPayV1.sol";
@@ -34,7 +34,9 @@ event DataSetAbandoned(uint256 indexed dataSetId, uint256 pdpRailId, uint256 cac
 
 event RailRateUpdated(uint256 indexed dataSetId, uint256 railId, uint256 newRate);
 
-library Rails {
+/// @title LibRails
+/// @notice Payment rail operations inlined into the FWSS modules.
+library LibRails {
     /// @notice Validates the payer is set up to add pieces, not just create the dataset.
     /// @dev    The lifecycle reserve is consumed at creation; the per-dataset fee headroom is only
     ///         consumed once pieces are added. Empty datasets leave it as approved headroom.
@@ -106,7 +108,7 @@ library Rails {
         address payer,
         address payee,
         address filBeamBeneficiaryAddress
-    ) public returns (uint256 pdpRailId, uint256 cacheMissRailId, uint256 cdnRailId) {
+    ) internal returns (uint256 pdpRailId, uint256 cacheMissRailId, uint256 cdnRailId) {
         bool hasCDN = filBeamBeneficiaryAddress != address(0);
         // Validate payer has sufficient funds and operator approvals to cover the required lockup
         // If CDN is enabled, validation must account for the additional fixed lockup amounts
@@ -159,7 +161,7 @@ library Rails {
     }
 
     function terminateCDNRails(FilecoinPayV1 payments, uint256 dataSetId, uint256 cacheMissRailId, uint256 cdnRailId)
-        public
+        internal
     {
         try payments.terminateRail(cacheMissRailId) {} catch {}
         try payments.terminateRail(cdnRailId) {} catch {}
@@ -181,7 +183,7 @@ library Rails {
         uint256 pdpRailId,
         uint256 cacheMissRailId,
         uint256 cdnRailId
-    ) public {
+    ) internal {
         payments.settleRail(pdpRailId, block.number);
 
         // Try to zero the lockup period before termination.
@@ -227,7 +229,7 @@ library Rails {
         uint256 cdnRailId,
         uint256 cacheMissAmountToAdd,
         uint256 cdnAmountToAdd
-    ) public {
+    ) internal {
         // Both rails must be active for any top-up operation
         FilecoinPayV1.RailView memory cdnRail = payments.getRail(cdnRailId);
         FilecoinPayV1.RailView memory cacheMissRail = payments.getRail(cacheMissRailId);
@@ -258,7 +260,7 @@ library Rails {
         uint256 cacheMissRailId,
         uint256 cdnAmount,
         uint256 cacheMissAmount
-    ) public {
+    ) internal {
         if (cdnAmount > 0) {
             payments.modifyRailPayment(cdnRailId, 0, cdnAmount);
         }
@@ -295,7 +297,7 @@ library Rails {
         uint96 reserveBalance,
         uint256 pdpEndEpoch,
         bool immediateTermination
-    ) public returns (uint96 newReserveBalance) {
+    ) internal returns (uint96 newReserveBalance) {
         uint256 newStorageRatePerEpoch = calculateStorageRate(leafCount);
         if (immediateTermination) {
             // No try/catch: immediateTermination implies the payer consented and is solvent.
