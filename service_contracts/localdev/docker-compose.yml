@@ -1,0 +1,28 @@
+version: "3.8"
+
+services:
+  filecoin-localdev:
+    build:
+      context: ..
+      dockerfile: localdev/Dockerfile
+    ports:
+      - "8545:8545"
+    environment:
+      # Internal Anvil port (not exposed)
+      - ANVIL_PORT=8546
+      # External RPC port (exposed)
+      - RPC_PORT=8545
+      # Block time in seconds (default: 12 seconds to match Filecoin epoch time)
+      # Override with: ANVIL_BLOCK_TIME=30 docker-compose up -d
+      - ANVIL_BLOCK_TIME=${ANVIL_BLOCK_TIME:-3}
+    healthcheck:
+      # Sentinel file is touched by the entrypoint after contracts are deployed
+      # (init mode) or state is loaded (load mode) AND mockrpc is accepting
+      # requests. A port-probe healthcheck would flip healthy before contracts
+      # are deployed.
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
