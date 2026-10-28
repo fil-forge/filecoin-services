@@ -8,9 +8,9 @@
 # 3. PDPVerifier (implementation + proxy)
 # 4. FilecoinPayV1
 # 5. ServiceProviderRegistry (implementation + proxy)
-# 6. SignatureVerificationLib
-# 7. FilecoinWarmStorageService (implementation + proxy)
-# 8. FilecoinWarmStorageServiceStateView
+# 6. FilecoinWarmStorageService: the modules josuke.json lists, their migration and
+#    the ERC-8167 dispatcher behind the proxy (script/FWSSDeploy.s.sol). The proxy
+#    serves the StateView reads itself.
 #
 # Outputs contract addresses to /deployed-addresses.json
 
@@ -32,8 +32,6 @@ PAYER_ADDRESS="0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
 CHALLENGE_FINALITY=3       # ~36 seconds finality (3 blocks × 12 sec)
 MAX_PROVING_PERIOD=25      # 5 minutes per proving period (25 blocks × 12 sec)
 CHALLENGE_WINDOW_SIZE=5    # ~1 minute challenge window (5 blocks × 12 sec)
-SERVICE_NAME="Local Test Service"
-SERVICE_DESCRIPTION="Local development environment for testing"
 FILBEAM_CONTROLLER_ADDRESS="$DEPLOYER_ADDRESS"
 FILBEAM_BENEFICIARY_ADDRESS="$DEPLOYER_ADDRESS"
 
@@ -75,11 +73,6 @@ deploy() {
 
     # Let forge handle nonce management automatically
     local cmd="forge create --rpc-url $ANVIL_RPC --private-key $DEPLOYER_PRIVATE_KEY --broadcast"
-
-    # Add libraries if set
-    if [ -n "$LIBRARIES" ]; then
-        cmd="$cmd --libraries $LIBRARIES"
-    fi
 
     cmd="$cmd $contract"
 
@@ -149,7 +142,7 @@ echo "Setting up mock precompiles for FVM burn/pay operations..."
 echo -e "${BOLD}Deploying FVMCallActorById mock${RESET}"
 FVM_BY_ID_OUTPUT=$(forge create --rpc-url "$ANVIL_RPC" --private-key "$DEPLOYER_PRIVATE_KEY" \
     --broadcast \
-    lib/pdp/lib/fvm-solidity/src/mocks/FVMCallActorById.sol:FVMCallActorById 2>&1)
+    localdev/contracts/LocalFVMCallActor.sol:LocalFVMCallActorById 2>&1) || true
 FVM_BY_ID_TEMP=$(echo "$FVM_BY_ID_OUTPUT" | grep "Deployed to" | awk '{print $3}')
 if [ -z "$FVM_BY_ID_TEMP" ]; then
     echo "ERROR: Failed to deploy FVMCallActorById mock"
@@ -162,7 +155,7 @@ echo -e "  ${GREEN}✓${RESET} Deployed to $FVM_BY_ID_TEMP"
 echo -e "${BOLD}Deploying FVMCallActorByAddress mock${RESET}"
 FVM_BY_ADDR_OUTPUT=$(forge create --rpc-url "$ANVIL_RPC" --private-key "$DEPLOYER_PRIVATE_KEY" \
     --broadcast \
-    lib/pdp/lib/fvm-solidity/src/mocks/FVMCallActorByAddress.sol:FVMCallActorByAddress 2>&1)
+    localdev/contracts/LocalFVMCallActor.sol:LocalFVMCallActorByAddress 2>&1) || true
 FVM_BY_ADDR_TEMP=$(echo "$FVM_BY_ADDR_OUTPUT" | grep "Deployed to" | awk '{print $3}')
 if [ -z "$FVM_BY_ADDR_TEMP" ]; then
     echo "ERROR: Failed to deploy FVMCallActorByAddress mock"
@@ -176,7 +169,7 @@ echo -e "  ${GREEN}✓${RESET} Deployed to $FVM_BY_ADDR_TEMP"
 echo -e "${BOLD}Deploying DeterministicBeaconRandomness mock${RESET}"
 FVM_RANDOMNESS_OUTPUT=$(forge create --rpc-url "$ANVIL_RPC" --private-key "$DEPLOYER_PRIVATE_KEY" \
     --broadcast \
-    localdev/contracts/DeterministicBeaconRandomness.sol:DeterministicBeaconRandomness 2>&1)
+    localdev/contracts/DeterministicBeaconRandomness.sol:DeterministicBeaconRandomness 2>&1) || true
 FVM_RANDOMNESS_TEMP=$(echo "$FVM_RANDOMNESS_OUTPUT" | grep "Deployed to" | awk '{print $3}')
 if [ -z "$FVM_RANDOMNESS_TEMP" ]; then
     echo "ERROR: Failed to deploy DeterministicBeaconRandomness mock"
@@ -236,8 +229,10 @@ echo
 echo "=========================================="
 echo "Step 3: Deploy PDPVerifier"
 echo "=========================================="
-VERIFIER_IMPL=$(deploy "PDPVerifier Implementation" "lib/pdp/src/PDPVerifier.sol:PDPVerifier" 1)
-INIT_DATA=$(cast calldata "initialize(uint256)" "$CHALLENGE_FINALITY")
+# PDPVerifier builds with its own foundry.toml (optimizer_runs = 1); built with
+# the service contracts' settings it exceeds the EIP-170 contract size limit.
+VERIFIER_IMPL=$(cd lib/pdp && deploy "PDPVerifier Implementation" "src/PDPVerifier.sol:PDPVerifier" 1 "$CHALLENGE_FINALITY")
+INIT_DATA=$(cast calldata "initialize()")
 PDP_VERIFIER_ADDRESS=$(deploy_proxy "PDPVerifier" "$VERIFIER_IMPL" "$INIT_DATA")
 
 echo
@@ -256,54 +251,40 @@ SERVICE_PROVIDER_REGISTRY_PROXY_ADDRESS=$(deploy_proxy "ServiceProviderRegistry"
 
 echo
 echo "=========================================="
-echo "Step 6: Deploy SignatureVerificationLib"
+echo "Step 6: Deploy FilecoinWarmStorageService"
 echo "=========================================="
-SIGNATURE_VERIFICATION_LIB_ADDRESS=$(deploy "SignatureVerificationLib" "src/lib/SignatureVerificationLib.sol:SignatureVerificationLib")
+# SKIP_UPDATE_DEPLOYMENTS keeps the script from recording chain 31337 in deployments.json.
+# --json reports what run() returns.
+echo -e "${BOLD}Deploying FilecoinWarmStorageService on the ERC-8167 dispatcher${RESET}"
+if ! FWSS_OUTPUT=$(SKIP_UPDATE_DEPLOYMENTS=true \
+    FILECOIN_PAY_ADDRESS="$PAYMENTS_CONTRACT_ADDRESS" \
+    PDP_VERIFIER_PROXY_ADDRESS="$PDP_VERIFIER_ADDRESS" \
+    USDFC_TOKEN_ADDRESS="$USDFC_TOKEN_ADDRESS" \
+    FILBEAM_BENEFICIARY_ADDRESS="$FILBEAM_BENEFICIARY_ADDRESS" \
+    SERVICE_PROVIDER_REGISTRY_PROXY_ADDRESS="$SERVICE_PROVIDER_REGISTRY_PROXY_ADDRESS" \
+    SESSION_KEY_REGISTRY_ADDRESS="$SESSION_KEY_REGISTRY_ADDRESS" \
+    MAX_PROVING_PERIOD="$MAX_PROVING_PERIOD" \
+    CHALLENGE_WINDOW_SIZE="$CHALLENGE_WINDOW_SIZE" \
+    FILBEAM_CONTROLLER_ADDRESS="$FILBEAM_CONTROLLER_ADDRESS" \
+    forge script script/FWSSDeploy.s.sol \
+        --rpc-url "$ANVIL_RPC" --private-key "$DEPLOYER_PRIVATE_KEY" --broadcast --json 2>&1); then
+    echo "ERROR: Failed to deploy FilecoinWarmStorageService"
+    echo "$FWSS_OUTPUT"
+    exit 1
+fi
+FWSS_DISPATCHER_ADDRESS=$(jq -rR 'fromjson? | .returns.dispatcher.value // empty' <<<"$FWSS_OUTPUT")
+WARM_STORAGE_SERVICE_ADDRESS=$(jq -rR 'fromjson? | .returns.proxy.value // empty' <<<"$FWSS_OUTPUT")
+if [ -z "$WARM_STORAGE_SERVICE_ADDRESS" ] || [ -z "$FWSS_DISPATCHER_ADDRESS" ]; then
+    echo "ERROR: FWSSDeploy did not return the FWSS proxy and dispatcher"
+    echo "$FWSS_OUTPUT"
+    exit 1
+fi
+echo -e "  ${GREEN}✓${RESET} Dispatcher: $FWSS_DISPATCHER_ADDRESS"
+echo -e "  ${GREEN}✓${RESET} Proxy:      $WARM_STORAGE_SERVICE_ADDRESS"
 
 echo
 echo "=========================================="
-echo "Step 7: Deploy FilecoinWarmStorageService"
-echo "=========================================="
-export LIBRARIES="src/lib/SignatureVerificationLib.sol:SignatureVerificationLib:$SIGNATURE_VERIFICATION_LIB_ADDRESS"
-FWS_IMPL=$(deploy "FilecoinWarmStorageService Implementation" \
-    "src/FilecoinWarmStorageService.sol:FilecoinWarmStorageService" \
-    "$PDP_VERIFIER_ADDRESS" \
-    "$PAYMENTS_CONTRACT_ADDRESS" \
-    "$USDFC_TOKEN_ADDRESS" \
-    "$FILBEAM_BENEFICIARY_ADDRESS" \
-    "$SERVICE_PROVIDER_REGISTRY_PROXY_ADDRESS" \
-    "$SESSION_KEY_REGISTRY_ADDRESS" \
-    1)
-unset LIBRARIES
-
-FWS_INIT_DATA=$(cast calldata "initialize(uint64,uint256,address,string,string)" \
-    "$MAX_PROVING_PERIOD" \
-    "$CHALLENGE_WINDOW_SIZE" \
-    "$FILBEAM_CONTROLLER_ADDRESS" \
-    "$SERVICE_NAME" \
-    "$SERVICE_DESCRIPTION")
-WARM_STORAGE_SERVICE_ADDRESS=$(deploy_proxy "FilecoinWarmStorageService" "$FWS_IMPL" "$FWS_INIT_DATA")
-
-echo
-echo "=========================================="
-echo "Step 8: Deploy StateView"
-echo "=========================================="
-WARM_STORAGE_VIEW_ADDRESS=$(deploy "FilecoinWarmStorageServiceStateView" \
-    "src/FilecoinWarmStorageServiceStateView.sol:FilecoinWarmStorageServiceStateView" \
-    "$WARM_STORAGE_SERVICE_ADDRESS")
-
-echo
-echo "=========================================="
-echo "Step 9: Set View Address on Service"
-echo "=========================================="
-echo "Setting view contract address..."
-cast send --rpc-url "$ANVIL_RPC" --private-key "$DEPLOYER_PRIVATE_KEY" \
-    "$WARM_STORAGE_SERVICE_ADDRESS" "setViewContract(address)" "$WARM_STORAGE_VIEW_ADDRESS" > /dev/null 2>&1
-echo -e "  ${GREEN}✓${RESET} View address set"
-
-echo
-echo "=========================================="
-echo "Step 10: Setup Payer Account"
+echo "Step 7: Setup Payer Account"
 echo "=========================================="
 
 # Mint USDFC to payer (100,000 USDFC with 6 decimals)
@@ -362,16 +343,14 @@ cat > "$OUTPUT_FILE" << EOF
     "PDPVerifier": "$PDP_VERIFIER_ADDRESS",
     "FilecoinPayV1": "$PAYMENTS_CONTRACT_ADDRESS",
     "ServiceProviderRegistry": "$SERVICE_PROVIDER_REGISTRY_PROXY_ADDRESS",
-    "SignatureVerificationLib": "$SIGNATURE_VERIFICATION_LIB_ADDRESS",
     "FilecoinWarmStorageService": "$WARM_STORAGE_SERVICE_ADDRESS",
-    "FilecoinWarmStorageServiceStateView": "$WARM_STORAGE_VIEW_ADDRESS"
+    "FilecoinWarmStorageServiceStateView": "$WARM_STORAGE_SERVICE_ADDRESS",
+    "FWSSDispatcher": "$FWSS_DISPATCHER_ADDRESS"
   },
   "config": {
     "challengeFinality": $CHALLENGE_FINALITY,
     "maxProvingPeriod": $MAX_PROVING_PERIOD,
-    "challengeWindowSize": $CHALLENGE_WINDOW_SIZE,
-    "serviceName": "$SERVICE_NAME",
-    "serviceDescription": "$SERVICE_DESCRIPTION"
+    "challengeWindowSize": $CHALLENGE_WINDOW_SIZE
   }
 }
 EOF
@@ -390,7 +369,7 @@ echo "  PDPVerifier:                $PDP_VERIFIER_ADDRESS"
 echo "  FilecoinPayV1:              $PAYMENTS_CONTRACT_ADDRESS"
 echo "  ServiceProviderRegistry:    $SERVICE_PROVIDER_REGISTRY_PROXY_ADDRESS"
 echo "  FilecoinWarmStorageService: $WARM_STORAGE_SERVICE_ADDRESS"
-echo "  StateView:                  $WARM_STORAGE_VIEW_ADDRESS"
+echo "  FWSS dispatcher:            $FWSS_DISPATCHER_ADDRESS"
 echo
 echo "Accounts:"
 echo "  Deployer: $DEPLOYER_ADDRESS"

@@ -7,6 +7,10 @@ on:
       - 'service_contracts/localdev/**'
       - 'service_contracts/lib/**'
       - 'service_contracts/src/**'
+      - 'service_contracts/script/**'
+      - 'service_contracts/josuke.json'
+      - 'service_contracts/Makefile'
+      - 'service_contracts/foundry.toml'
       - '.github/workflows/publish-localdev.yml'
   workflow_dispatch:
 

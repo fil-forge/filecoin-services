@@ -171,9 +171,10 @@ cat deployed-addresses.json
 - PDPVerifier (proxy)
 - FilecoinPayV1
 - ServiceProviderRegistry (proxy)
-- SignatureVerificationLib
-- FilecoinWarmStorageService (proxy)
-- FilecoinWarmStorageServiceStateView
+- FilecoinWarmStorageService (proxy), deployed by `script/FWSSDeploy.s.sol`: the
+  modules `josuke.json` lists, their migration and the ERC-8167 dispatcher
+  (`FWSSDispatcher`). The proxy serves the StateView reads itself, so
+  `FilecoinWarmStorageServiceStateView` holds the proxy address.
 
 ### FVM Precompile Mocks
 
@@ -313,7 +314,7 @@ The `DeterministicBeaconRandomness` precompile returns `keccak256(abi.encode(epo
 │  │                                                    │ │
 │  │  Pre-deployed: MockUSDFC, PDPVerifier,             │ │
 │  │  FilecoinPayV1, ServiceProviderRegistry,           │ │
-│  │  FilecoinWarmStorageService, StateView             │ │
+│  │  FilecoinWarmStorageService (ERC-8167 dispatcher)  │ │
 │  └────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────┘
 ```
