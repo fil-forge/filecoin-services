@@ -328,6 +328,17 @@ cd service_contracts/localdev
 docker build -t filecoin-localdev:local -f Dockerfile ..
 ```
 
+The contracts and the mock RPC server build on the build machine's own platform, so a multi-platform build does not compile them under emulation. Compiled contracts are the same on every platform.
+
+### Smoke Test
+
+`scripts/smoke-test.sh` starts an image without network access, waits until it has deployed the contracts, and fails if forge compiled anything at startup. Pull requests that touch the image run it for both platforms.
+
+```bash
+./scripts/smoke-test.sh filecoin-localdev:local
+./scripts/smoke-test.sh filecoin-localdev:local linux/amd64
+```
+
 ### Generating State Files for Tests
 
 ```bash
