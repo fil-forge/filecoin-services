@@ -35,6 +35,9 @@ remappings = [
     '@pdp/=lib/pdp/src/',
     '@session-key-registry/=lib/session-key-registry/src/',
     '@fvm-solidity/=lib/pdp/lib/fvm-solidity/src/',
+    # PDPVerifier imports `fvm-solidity/` bare. Without this, forge picks one of the two fvm-solidity
+    # submodules by directory order, which can differ between builds and recompile the localdev image.
+    'fvm-solidity/=lib/pdp/lib/fvm-solidity/src/',
     '@pythnetwork/pyth-sdk-solidity/=lib/pdp/lib/pyth-sdk-solidity/',
     'solady/=lib/solady/src/',
 ]
