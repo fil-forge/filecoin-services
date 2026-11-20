@@ -192,7 +192,9 @@ export ETH_RPC_URL="https://api.node.glif.io/rpc/v1"
 export FWSS_PROXY_ADDRESS="0x8408502033C418E1bbC97cE9ac48E5528F371A9f"
 ```
 
-`cast` unlocks `ETH_KEYSTORE` even for read-only calls and then sends them from the keystore address (foundry-rs/foundry#17388, see #621). Keep `ETH_KEYSTORE` out of the environment for every read-only step; set it only for `josuke deploy` and the transition deploy script.
+`cast` unlocks `ETH_KEYSTORE` even for read-only calls and then sends them from the keystore address (foundry-rs/foundry#17388, see #621).
+Keep `ETH_KEYSTORE` and `ETH_PASSWORD` out of the environment for every read-only step; set them only for `josuke deploy` and the transition deploy script.
+cast reads `ETH_PASSWORD` as `--password-file` and rejects it without `--keystore`.
 
 ### Operating Rules
 
@@ -280,11 +282,14 @@ make test           # builds the ERC-8167 dispatcher artifacts the tests need (m
 - [ ] Name the technical owner, update the Overview, and confirm they own the written upgrade plan and go/no-go decision
 - [ ] Obtain technical-owner approval of the two-network deployment inventory:
   - Run `josuke check --chain 314159` and `josuke check --chain 314` and record the listed facets.
+  - For every `CHANGED` or `NEW` facet, changed constructor argument, layout change, and warning in that output, name the merged PR that intends it. `josuke check` passes on any internally consistent value (a constructor argument changed from 150 to 10 is reported, not failed), so this review is the only gate on what the values should be. A change nobody can attribute blocks the release.
   - **Path A only:** record each network's current implementation (`cast implementation --rpc-url "$ETH_RPC_URL" "$FWSS_PROXY_ADDRESS"`). It is the transition's rollback target, and Procedure A2 checks the transition pins it.
   - Populate Dependency Targets and Compatibility. Stop, correct the release ref, and rerun for any unapproved difference.
+  - Check every dependency record that `verify-deployments.sh` skips as pinned, PDPVerifier included, against an independent source: the creation transaction's constructor arguments, or the dependency's release build with the pin ignored (as #606 did for PDPVerifier). Record the result. No tool checks these records otherwise.
 - [ ] Fill Cross-Repo Impact with required PRs, issues, releases, or `None`
 - [ ] Fill Rollback Plan from the [function table](#how-the-upgrade-functions-differ)
 - [ ] Run foc-devnet post-upgrade state validation, or record the technical owner's approved exception
+- [ ] Technical owner decides whether this release needs a fork rehearsal and records the decision. If it does, rehearse the upgrade on a local fork of each network with real data sets: announce, execute, and run the post-upgrade checks against the frozen candidate. For the storage-terms introduction, cover data sets with a pending fee, piece additions, piece removals, and termination with an underfunded payer, and confirm the wrapper (not the raw migration) is the rehearsed target. Record the fork block and results.
 - [ ] Freeze the deploy commit and record it in Release Tracking
 - [ ] Create and push the stack tag from the frozen deploy commit before any live upgrade transaction:
 
@@ -346,7 +351,8 @@ Deploy both networks from the frozen tag before any announce/execute. Deploying 
 - [ ] **Calibnet:** run [Procedure A1](#a1-deploy) (Path A) or [Procedure B1](#b1-deploy) (Path B) in the Calibnet environment
 - [ ] **Mainnet:** run [Procedure A1](#a1-deploy) (Path A) or [Procedure B1](#b1-deploy) (Path B) in the Mainnet environment
 - [ ] Open a PR with the updated `josuke.json` (and, for Path A, `deployments.json`) and record it in Release Tracking. Reviewers verify against this exact ledger.
-- [ ] A second engineer runs `josuke verify` in each environment from the PR's commit and records the result in the Run Log
+- [ ] On the PR's commit, `josuke check --strict` passes: after `josuke deploy`, the staged `proposed` deployment must match the frozen source exactly. Paste its `--format markdown` report into the PR.
+- [ ] A second engineer runs `josuke verify` in each environment from the PR's commit and records the result in the Run Log. `josuke verify` proves the chain matches the ledger, not that the ledger is right, so the same engineer checks the recorded constructor arguments of each new facet against the Phase 1 attribution.
 - [ ] Add the announced target for each network to the GitHub pre-release rollout status
 
 ### Phase 3: Calibnet Announce + Execute
@@ -387,6 +393,8 @@ filecoin-pin add "/tmp/$RUN_ID.txt" \
 ```
 
 The unique `smoke_run` metadata is required so this validates new Data Set creation rather than reusing an existing Data Set.
+
+Fund the wallet first. Each new Data Set needs the 30-day data-set fee lockup plus the lifecycle reserve available in Filecoin Pay (0.62 USDFC at v1.5.0 pricing; see `getPriceList()`), so two copies need about 1.3 USDFC. filecoin-pin also refuses to start below 0.1 FIL. Its own "required" estimate (filecoin-pin 2.2.1) leaves out the per-Data-Set lockup, and an underfunded copy fails with `InsufficientLockupFunds`.
 
 </details>
 
@@ -436,6 +444,8 @@ filecoin-pin add "/tmp/$RUN_ID.txt" \
 
 The unique `smoke_run` metadata is required so this validates new Data Set creation rather than reusing an existing Data Set.
 
+Fund the wallet first. Each new Data Set needs the 30-day data-set fee lockup plus the lifecycle reserve available in Filecoin Pay (0.62 USDFC at v1.5.0 pricing; see `getPriceList()`), so two copies need about 1.3 USDFC. filecoin-pin also refuses to start below 0.1 FIL. Its own "required" estimate (filecoin-pin 2.2.1) leaves out the per-Data-Set lockup, and an underfunded copy fails with `InsufficientLockupFunds`.
+
 </details>
 
 - [ ] Verify the proxy on Blockscout
@@ -443,7 +453,7 @@ The unique `smoke_run` metadata is required so this validates new Data Set creat
 
 ### Phase 5: Promote Release and Close Out
 - [ ] Confirm live Calibnet and Mainnet proxies point at the dispatcher, slot 19 is cleared, and `josuke accept` has been committed for both
-- [ ] Run `josuke audit` against each network and record the result
+- [ ] Run `josuke audit` against each network and record the result. On an RPC without historical state, such as Glif, pass `--from-block` with a block before the execute
 - [ ] Resolve or complete every public operational notice after the corresponding rollout and post-upgrade validation succeed. Publish a final status update and record each notice link and final state in Release Tracking.
 - [ ] Confirm cross-repo follow-ups are complete or tracked with owners
 - [ ] Merge the `josuke.json` / `deployments.json` PR(s) to `main` after live-state verification, and record the PR link(s) in Release Tracking
@@ -602,7 +612,7 @@ CALLDATA_ONLY=true forge script script/FWSSDispatcherTransitionExecute.s.sol --r
 
 With `CALLDATA_ONLY=true` the script checks that the plan is the transition and ready, that the transition pins the migration `josuke.json` proposes and that migration's unchanged code, the proxy's current implementation as the rollback target, and the pinned dispatcher. It then simulates the upgrade as the proxy owner and prints the Safe transaction: `upgradeToAndCall(transition, migrate(migration))` on the proxy. That one call points the proxy at the dispatcher and runs the migration; if any part reverts, nothing changes.
 
-The upgrade call uses about 182M gas on FEVM. Leave the gas limit to the Safe's estimate; a signer must not cap it below that.
+The upgrade call used about 1.36B gas on Calibnet and 1.64B on Mainnet (v1.5.0, 73 routes). Leave the gas limit to the Safe's estimate; a signer must not cap it.
 
 An EOA owner broadcasts the same call instead: replace `CALLDATA_ONLY=true` with `--keystore "$ETH_KEYSTORE" --password-file "$ETH_PASSWORD" --broadcast --skip-simulation`.
 
@@ -641,6 +651,47 @@ export MIGRATION=$(source tools/josuke.sh; josuke_proposed_migration "$FWSS_PROX
 echo "Migration $MIGRATION"
 ```
 
+**Storage-terms introduction only:** this feature upgrades an already-modular
+deployment (Path B). Before recording or announcing the target, wrap the raw
+Josuke migration so record zero is initialized in the same transaction as the
+route installation:
+
+```bash
+export RAW_MIGRATION="$MIGRATION"
+forge create src/FWSSStorageTermsMigration.sol:FWSSStorageTermsMigration \
+  --rpc-url "$ETH_RPC_URL" --keystore "$ETH_KEYSTORE" --password-file "$ETH_PASSWORD" \
+  --broadcast --constructor-args "$RAW_MIGRATION"
+# Set MIGRATION to the wrapper's reported deployment address.
+export MIGRATION="<deployed FWSSStorageTermsMigration address>"
+cast call --rpc-url "$ETH_RPC_URL" "$MIGRATION" 'migration()(address)'
+```
+
+- [ ] Confirm the wrapper's `migration()` equals `RAW_MIGRATION`.
+- [ ] From a clean checkout of the frozen deploy commit, with the reviewed,
+  committed `josuke.json`, run the wrapper bytecode check. Record both migration
+  addresses and code hashes it prints in the Run Log. `josuke verify` validates
+  the raw route migration and facets, not this wrapper.
+
+```bash
+unset ETH_KEYSTORE ETH_PASSWORD
+./tools/verify-storage-terms-wrapper.sh "$MIGRATION"
+```
+
+The wrapper's sole immutable is the raw migration address. The script fills it
+from the reviewed ledger, not from the deployed code or its `migration()` getter,
+then compares the complete runtime bytecode. It prints `STOP` and exits non-zero
+for anything else, the raw migration included.
+
+- [ ] Use the **wrapper** as `MIGRATION` for B2–B4. Do not announce or execute the
+  raw route migration for the introduction: existing modular migration code does
+  not initialize storage terms.
+
+The wrapper obtains USDFC from the installed configuration and initializes zero
+only if unregistered. Later upgrades must not re-enable a disabled zero record.
+Leave the raw proposal in `josuke.json`; `josuke accept` verifies the installed
+routes after execution. Fresh modular deployments initialize zero directly.
+
+
 - [ ] Record `MIGRATION` as the announced target in the Run Log
 - [ ] Commit `josuke.json` to the Phase 2 PR
 
@@ -658,10 +709,11 @@ echo "Data:   $CALLDATA"
 
 #### B3: Review During the Delay
 
-`migrate` on the dispatcher checks only the migration's address, so `josuke verify` is what confirms the code that will run. Someone other than the announcing operator runs them, preferably more than once before `afterEpoch`:
+`migrate` on the dispatcher checks only the migration's address. `josuke verify` confirms the raw migration and facets; the storage-terms wrapper requires the additional B1 bytecode check. Someone other than the announcing operator performs these checks, preferably more than once before `afterEpoch`:
 
 - [ ] [Read the pending plan](#read-the-pending-plan): the target is still `$MIGRATION` and nobody announced anything else
 - [ ] `josuke verify` passes against the committed `josuke.json`
+- [ ] For the storage-terms introduction, run `./tools/verify-storage-terms-wrapper.sh "$PLANNED_TARGET"` from the independent reviewer's frozen checkout against the target read from the pending plan. Record the reviewer and output in the Run Log; stop on any failure.
 - [ ] The proxy still points at the dispatcher (rerun [Choose the Upgrade Path](#choose-the-upgrade-path))
 
 #### B4: Execute
@@ -670,6 +722,8 @@ echo "Data:   $CALLDATA"
 read_plan
 [ "$PLANNED_TARGET" = "$(cast to-check-sum-address "$MIGRATION")" ] || echo "STOP: the pending plan is not the reviewed migration"
 josuke verify || echo "STOP: josuke verify failed"
+# Storage-terms introduction only: the target must be the reviewed wrapper, never the raw migration
+./tools/verify-storage-terms-wrapper.sh "$PLANNED_TARGET" || echo "STOP: the pending plan is not the reviewed storage-terms wrapper"
 
 CALLDATA=$(cast calldata 'migrate(address)' "$MIGRATION")
 OWNER=$(cast call --rpc-url "$ETH_RPC_URL" "$FWSS_PROXY_ADDRESS" 'owner()(address)')
@@ -678,7 +732,8 @@ echo "Target: $FWSS_PROXY_ADDRESS"
 echo "Data:   $CALLDATA"
 ```
 
-- [ ] Every signer reruns the two `STOP` checks and the simulation, and [reproduces and decodes](#reproduce-and-decode-safe-calldata) `$CALLDATA` before signing
+- [ ] Every signer reruns the `STOP` checks and the simulation, and [reproduces and decodes](#reproduce-and-decode-safe-calldata) `$CALLDATA` before signing
+- [ ] For the storage-terms introduction, every signer runs the wrapper check above from their own frozen checkout against the freshly read pending target. Stop on any failure; the target must match the independently reviewed wrapper address and code hash.
 
 ### Post-Upgrade Checks
 
@@ -703,10 +758,28 @@ for sig in 'announceMigration(address,uint96)' 'migrate(address)' 'implementatio
 done
 
 josuke accept
-git add josuke.json && git commit -m "chore(josuke): accept the $CHAIN migration"
+# deployments.json keeps the previous fwss_version until the execute; record the live one now
+jq --indent 2 --arg chain "$CHAIN" --arg v "$(cast call --rpc-url "$ETH_RPC_URL" "$FWSS_PROXY_ADDRESS" 'VERSION()(string)' | tr -d '"')" \
+  '.[$chain].metadata.fwss_version = $v' deployments.json > deployments.json.tmp && mv deployments.json.tmp deployments.json
+git add josuke.json deployments.json && git commit -m "chore(josuke): accept the $CHAIN migration"
 ```
 
 Every upgrade route must point at a deployed module; a zero address means FWSS can no longer be upgraded. Stop and escalate if any check differs from its expected value.
+
+For the storage-terms introduction, additionally confirm:
+
+```bash
+cast call --rpc-url "$ETH_RPC_URL" "$FWSS_PROXY_ADDRESS" \
+  'getStorageTerms(bytes32)((address,uint8,bytes32,uint96),bool)' \
+  0x0000000000000000000000000000000000000000000000000000000000000000
+```
+
+The result must be the deployment's USDFC token, decimals `18`, zero salt,
+price `2500000000000000000`, and enabled `true`. Confirm existing datasets
+report zero through `getDataSetV2`, legacy getter arrays still decode correctly,
+and a six-decimal registered currency completes creation, piece addition, and
+termination with scaled fees.
+
 
 ---
 

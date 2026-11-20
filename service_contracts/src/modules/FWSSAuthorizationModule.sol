@@ -22,6 +22,8 @@ import {
     TERMINATE_FEE
 } from "../lib/PriceListUSDFC.sol";
 import {LibRails} from "../lib/LibRails.sol";
+import {LibStorageTerms} from "../lib/LibStorageTerms.sol";
+import {StoragePricing} from "../lib/StoragePricing.sol";
 import {FWSSEIP712} from "../lib/FWSSEIP712.sol";
 import {FWSSPDPVerifier} from "../lib/FWSSPDPVerifier.sol";
 import {LibStoragePayments} from "../lib/LibStoragePayments.sol";
@@ -124,14 +126,24 @@ contract FWSSAuthorizationModule is FWSSStorage, FWSSEIP712, FWSSPDPVerifier {
             dataSetId, payer, info.clientDataSetId, pieceData, nonce, metadataKeys, metadataValues, signature
         );
 
-        uint96 pending =
-            info.pendingOneTimePayments + uint96(ADD_PIECES_BASE_FEE + pieceData.length * ADD_PIECES_PER_PIECE_FEE);
+        uint96 pending = _addPendingFee(
+            info.pendingOneTimePayments,
+            StoragePricing.scaleAmount(
+                ADD_PIECES_BASE_FEE + pieceData.length * ADD_PIECES_PER_PIECE_FEE, _tokenDecimals(info)
+            )
+        );
         uint96 reserveBalance = info.lifecycleReserveBalance;
 
         // Validate lockup for the new data set size (fail-fast if client has insufficient funds)
         uint256 currentLeafCount = IPDPVerifier(pdpVerifierAddress).getDataSetLeafCount(dataSetId);
         LibStoragePayments.updatePaymentRates(
-            dataSetId, info, currentLeafCount, pending, reserveBalance, false, paymentContract
+            dataSetId,
+            info,
+            StoragePricing.calculateStorageRate(currentLeafCount, info.storageTermsId),
+            pending,
+            reserveBalance,
+            false,
+            paymentContract
         );
 
         if (metadataOmitted) {
@@ -203,17 +215,17 @@ contract FWSSAuthorizationModule is FWSSStorage, FWSSEIP712, FWSSPDPVerifier {
         // Verify the signature
         verifySchedulePieceRemovalsSignature(dataSetId, payer, info.clientDataSetId, pieceIds, signature);
 
-        uint96 newPending = info.pendingOneTimePayments + uint96(SCHEDULE_PIECE_REMOVALS_FEE);
+        uint96 newPending = _addPendingFee(
+            info.pendingOneTimePayments, StoragePricing.scaleAmount(SCHEDULE_PIECE_REMOVALS_FEE, _tokenDecimals(info))
+        );
         info.lifecycleReserveBalance = paymentContract.replenishReserveIfNeeded(
-            info.pdpRailId, info.pdpEndEpoch, info.lifecycleReserveBalance, newPending
+            info.pdpRailId, info.pdpEndEpoch, info.lifecycleReserveBalance, newPending, _tokenDecimals(info)
         );
         info.pendingOneTimePayments = newPending;
 
-        // Queue piece IDs for metadata cleanup at nextProvingPeriod
-        uint256[] storage scheduled = scheduledPieceMetadataRemovals[dataSetId];
-        for (uint256 i = 0; i < pieceIds.length; i++) {
-            scheduled.push(pieceIds[i]);
-        }
+        // piecesAdded may flush the fee before PDPVerifier drops these pieces, so pending alone cannot signal the
+        // smaller leaf count to nextProvingPeriod. An empty batch removes nothing.
+        if (pieceIds.length != 0) info.pieceRemovalsPending = true;
     }
 
     function terminateService(uint256 dataSetId, bytes calldata extraData) external {
@@ -244,7 +256,9 @@ contract FWSSAuthorizationModule is FWSSStorage, FWSSEIP712, FWSSPDPVerifier {
             bytes memory signature = abi.decode(extraData, (bytes));
             approver = verifyTerminateServiceSignature(info.payer, dataSetId, signature);
             immediateTermination = true;
-            info.pendingOneTimePayments += uint96(TERMINATE_FEE);
+            info.pendingOneTimePayments = _addPendingFee(
+                info.pendingOneTimePayments, StoragePricing.scaleAmount(TERMINATE_FEE, _tokenDecimals(info))
+            );
         } else {
             require(
                 msg.sender == info.payer || msg.sender == info.serviceProvider,
@@ -254,10 +268,17 @@ contract FWSSAuthorizationModule is FWSSStorage, FWSSEIP712, FWSSPDPVerifier {
         }
 
         uint96 pending = info.pendingOneTimePayments;
-        if (pending > 0) {
-            uint256 leafCount = IPDPVerifier(pdpVerifierAddress).getDataSetLeafCount(dataSetId);
+        if (pending > 0 || immediateTermination) {
+            // Flushing fees must not reprice an unchanged dataset.
+            uint256 currentRate = paymentContract.getRail(info.pdpRailId).paymentRate;
             LibStoragePayments.updatePaymentRates(
-                dataSetId, info, leafCount, pending, info.lifecycleReserveBalance, immediateTermination, paymentContract
+                dataSetId,
+                info,
+                currentRate,
+                pending,
+                info.lifecycleReserveBalance,
+                immediateTermination,
+                paymentContract
             );
         }
 
@@ -290,6 +311,16 @@ contract FWSSAuthorizationModule is FWSSStorage, FWSSEIP712, FWSSPDPVerifier {
         DataSetInfo storage info = dataSetInfo[dataSetId];
         require(info.pdpRailId != 0, Errors.InvalidDataSetId(dataSetId));
         require(info.pdpEndEpoch == 0, Errors.DataSetPaymentAlreadyTerminated(dataSetId));
+    }
+
+    function _tokenDecimals(DataSetInfo storage info) private view returns (uint8) {
+        return LibStorageTerms.getRecord(info.storageTermsId).tokenDecimals;
+    }
+
+    function _addPendingFee(uint96 pending, uint256 fee) private pure returns (uint96) {
+        uint256 total = uint256(pending) + fee;
+        require(total <= type(uint96).max);
+        return uint96(total);
     }
 
     /**
